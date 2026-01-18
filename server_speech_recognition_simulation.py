@@ -1,275 +1,228 @@
 """
-WiFi Speech Recognition Server
+WebSocket Speech Recognition Server
 --------------------------------
-This server receives audio from Raspberry Pi Pico W via WiFi,
+This server receives audio from a Web Browser via WebSockets,
 processes it with Google Speech-to-Text API, and sends back transcripts.
 
 Requirements:
-- pip install google-cloud-speech
+- pip install google-cloud-speech websockets
 - Google Cloud Speech-to-Text API enabled
 - Service account JSON key file
 
 Usage:
 1. Update GOOGLE_APPLICATION_CREDENTIALS path below
-2. Run: python server_speech_recognition.py
-3. Note the IP address shown
-4. Update Pico code with this IP address
-5. Power on Pico W
+2. Run: python server_speech_recognition_simulation.py
+3. Open the web simulation app
 """
 
 import os
-import socket
-import struct
-import threading
+import asyncio
 import queue
-from google.cloud import speech
+import threading
+import json
+import logging
+import websockets
+# Try importing google.cloud.speech, handle failure gracefully
+try:
+    from google.cloud import speech
+    GOOGLE_IMPORT_SUCCESS = True
+except ImportError:
+    GOOGLE_IMPORT_SUCCESS = False
+    logging.warning("google-cloud-speech not installed.")
 
-# Set your credentials
-# Set your credentials
-# START_USER_EDIT
-# Make sure to place your 'service_account.json' in the same folder or update the path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-cred_path = os.path.join(current_dir, "speech_key.json")
-if os.path.exists(cred_path):
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
-else:
-    # Fallback to hardcoded or environment variable if set manually
-    # os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"path\to\your\speech_key.json"
-    print(f"WARNING: Google Cloud credentials file not found at {cred_path}")
-# END_USER_EDIT
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # -------------------------------
 # CONFIGURATION
 # -------------------------------
 RATE = 16000
-HOST = "0.0.0.0"  # Listen on all network interfaces
-AUDIO_PORT = 5000
-TRANSCRIPT_PORT = 5001
-
-# Audio queue for streaming
-audio_queue = queue.Queue()
-
-# Connected clients
-audio_client = None
-transcript_client = None
+HOST = "0.0.0.0"
+PORT = 8000
+CREDENTIALS_FILE = "speech_key.json"
 
 # -------------------------------
-# GOOGLE SPEECH CLIENT
+# CLIENT SETUP
 # -------------------------------
-client = speech.SpeechClient()
-streaming_config = speech.StreamingRecognitionConfig(
-    config=speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=RATE,
-        language_code="en-US",
-        enable_automatic_punctuation=True
-    ),
-    interim_results=True
-)
+client = None
+streaming_config = None
+CREDENTIALS_VALID = False
 
-# -------------------------------
-# SOCKET SERVERS
-# -------------------------------
-def send_transcript(text):
-    """Send transcript to Pico"""
-    global transcript_client
-    if transcript_client:
+def setup_google_client():
+    global client, streaming_config, CREDENTIALS_VALID
+    
+    if not GOOGLE_IMPORT_SUCCESS:
+        logging.error("Google Cloud Speech library not found.")
+        return
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    cred_path = os.path.join(current_dir, CREDENTIALS_FILE)
+    
+    if os.path.exists(cred_path):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
         try:
-            data = text.encode('utf-8')
-            length = len(data)
-            # Send length header + data
-            transcript_client.send(struct.pack('<I', length))
-            transcript_client.send(data)
-            print(f"Sent to Pico: {text}")
-        except Exception as e:
-            print(f"Error sending transcript: {e}")
-            transcript_client = None
-
-def audio_server():
-    """Server to receive audio from Pico"""
-    global audio_client
-    
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind((HOST, AUDIO_PORT))
-    server_sock.listen(1)
-    
-    print(f"Audio server listening on port {AUDIO_PORT}")
-    
-    while True:
-        try:
-            conn, addr = server_sock.accept()
-            
-            # Check client type
-            client_type = conn.recv(10).decode('utf-8')
-            if client_type.startswith("AUDIO"):
-                print(f"Audio client connected from {addr}")
-                audio_client = conn
-                
-                # Receive audio data
-                while True:
-                    try:
-                        # Read length header (4 bytes)
-                        length_bytes = audio_client.recv(4)
-                        if len(length_bytes) != 4:
-                            break
-                        
-                        length = struct.unpack('<I', length_bytes)[0]
-                        
-                        # Read audio data
-                        audio_data = b''
-                        while len(audio_data) < length:
-                            chunk = audio_client.recv(length - len(audio_data))
-                            if not chunk:
-                                break
-                            audio_data += chunk
-                        
-                        if len(audio_data) == length:
-                            audio_queue.put(audio_data)
-                    except Exception as e:
-                        print(f"Error receiving audio: {e}")
-                        break
-                
-                print("Audio client disconnected")
-                audio_client = None
-        except Exception as e:
-            print(f"Audio server error: {e}")
-
-def transcript_server():
-    """Server to send transcripts to Pico"""
-    global transcript_client
-    
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind((HOST, TRANSCRIPT_PORT))
-    server_sock.listen(1)
-    
-    print(f"Transcript server listening on port {TRANSCRIPT_PORT}")
-    
-    while True:
-        try:
-            conn, addr = server_sock.accept()
-            
-            # Check client type
-            client_type = conn.recv(15).decode('utf-8')
-            if client_type.startswith("TRANSCRIPT"):
-                print(f"Transcript client connected from {addr}")
-                transcript_client = conn
-                
-                # Keep connection alive
-                while transcript_client:
-                    try:
-                        # Send keepalive every 30 seconds (send 0 length packet)
-                        import time
-                        time.sleep(30)
-                        if transcript_client:
-                            # Send 0 length packet as keepalive
-                            transcript_client.send(struct.pack('<I', 0))
-                    except Exception as e:
-                        print(f"Keepalive error: {e}")
-                        break
-                
-                print("Transcript client disconnected")
-                transcript_client = None
-        except Exception as e:
-            print(f"Transcript server error: {e}")
-
-# -------------------------------
-# AUDIO STREAM GENERATOR
-# -------------------------------
-def audio_stream_generator():
-    """Generate audio stream for Google Speech API"""
-    while True:
-        audio_data = audio_queue.get()
-        yield speech.StreamingRecognizeRequest(audio_content=audio_data)
-
-# -------------------------------
-# SPEECH RECOGNITION THREAD
-# -------------------------------
-def recognize_speech():
-    """Process audio with Google Speech-to-Text"""
-    print("Speech recognition thread started")
-    
-    while True:
-        try:
-            # Wait for audio client to connect
-            while not audio_client:
-                import time
-                time.sleep(1)
-            
-            print("Starting speech recognition stream...")
-            responses = client.streaming_recognize(
-                streaming_config, 
-                audio_stream_generator()
+            client = speech.SpeechClient()
+            streaming_config = speech.StreamingRecognitionConfig(
+                config=speech.RecognitionConfig(
+                    encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
+                    sample_rate_hertz=48000,
+                    language_code="en-US",
+                    enable_automatic_punctuation=True,
+                ),
+                interim_results=True
             )
+            CREDENTIALS_VALID = True
+            logging.info("Google Cloud Speech Client successfully initialized.")
+        except Exception as e:
+            logging.error(f"Failed to initialize Google Cloud Speech Client: {e}")
+            CREDENTIALS_VALID = False
+    else:
+        logging.warning(f"Google Cloud credentials file not found at {cred_path}")
+        CREDENTIALS_VALID = False
+
+# Initialize client on module load
+setup_google_client()
+
+class SpeechProcessor:
+    def __init__(self, loop):
+        self.loop = loop
+        self.audio_queue = queue.Queue()
+        self.transcript_queue = asyncio.Queue()
+        self.is_running = False
+        self._thread = None
+        self._sent_error = False
+
+    def start(self):
+        self.is_running = True
+        self._thread = threading.Thread(target=self._process_speech, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.is_running = False
+        self.audio_queue.put(None)  # Sentinel to stop generator
+
+    def add_audio(self, data):
+        if self.is_running:
+            self.audio_queue.put(data)
+
+    def _audio_generator(self):
+        while self.is_running:
+            data = self.audio_queue.get()
+            if data is None:
+                return
+            yield speech.StreamingRecognizeRequest(audio_content=data)
+
+    def _process_speech(self):
+        logging.info("Speech recognition thread started")
+        
+        # If no credentials, just drain queue and send error once
+        if not CREDENTIALS_VALID or not client:
+            if not self._sent_error:
+                # Notify frontend of missing credentials
+                self.loop.call_soon_threadsafe(
+                    self.transcript_queue.put_nowait,
+                    json.dumps({
+                        "error": "Missing Google Cloud Credentials. Server is running in simulation mode (no STT).",
+                        "transcript": "[System: No Credentials - Speech Recognition Disabled]",
+                        "isFinal": True
+                    })
+                )
+                self._sent_error = True
             
+            # Drain queue to prevent memory leak
+            while self.is_running:
+                data = self.audio_queue.get()
+                if data is None: 
+                    break
+            return
+
+        try:
+            responses = client.streaming_recognize(
+                streaming_config,
+                self._audio_generator()
+            )
+
             for response in responses:
+                if not self.is_running:
+                    break
+                    
                 if not response.results:
                     continue
-                
+
                 result = response.results[0]
-                transcript = result.alternatives[0].transcript
-                
-                if result.is_final:
-                    # Send final transcript
-                    print(f"Final: {transcript}")
-                    send_transcript(transcript)
-                else:
-                    # Send interim transcript with indicator
-                    print(f"Interim: {transcript}")
-                    send_transcript(transcript + "...")
+                if not result.alternatives:
+                    continue
                     
+                transcript = result.alternatives[0].transcript
+                is_final = result.is_final
+
+                # Send back to main loop via thread-safe call
+                self.loop.call_soon_threadsafe(
+                    self.transcript_queue.put_nowait,
+                    json.dumps({
+                        "transcript": transcript,
+                        "isFinal": is_final
+                    })
+                )
+
         except Exception as e:
-            print(f"Recognition error: {e}")
-            # Restart recognition after error
-            import time
-            time.sleep(2)
-            continue
+            logging.error(f"Recognition error: {e}")
+            # Notify frontend of error
+            self.loop.call_soon_threadsafe(
+                self.transcript_queue.put_nowait,
+                json.dumps({"error": str(e)})
+            )
+        finally:
+            logging.info("Speech recognition thread stopped")
 
-# -------------------------------
-# GET LOCAL IP ADDRESS
-# -------------------------------
-def get_local_ip():
-    """Get local IP address"""
+
+async def handler(websocket):
+    logging.info(f"Client connected: {websocket.remote_address}")
+    loop = asyncio.get_running_loop()
+    processor = SpeechProcessor(loop)
+    processor.start()
+
+    # Task to send transcripts back to client
+    async def sender():
+        try:
+            while True:
+                msg = await processor.transcript_queue.get()
+                await websocket.send(msg)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.error(f"Sender error: {e}")
+
+    sender_task = asyncio.create_task(sender())
+
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except:
-        return "127.0.0.1"
+        async for message in websocket:
+            # Assume binary message is audio
+            if isinstance(message, bytes):
+                processor.add_audio(message)
+            else:
+                logging.info(f"Received text message: {message}")
 
-# -------------------------------
-# START THREADS
-# -------------------------------
-print("=" * 50)
-print("WiFi Speech Recognition Server")
-print("=" * 50)
+    except websockets.exceptions.ConnectionClosed:
+        logging.info("Client disconnected")
+    except Exception as e:
+        logging.error(f"Handler error: {e}")
+    finally:
+        processor.stop()
+        sender_task.cancel()
+        logging.info("Cleaned up connection")
 
-local_ip = get_local_ip()
-print(f"\nServer IP Address: {local_ip}")
-print(f"Audio Port: {AUDIO_PORT}")
-print(f"Transcript Port: {TRANSCRIPT_PORT}")
-print(f"\nUpdate Pico code with:")
-print(f'  SERVER_IP = "{local_ip}"')
-print(f"  SERVER_PORT = {AUDIO_PORT}")
-print("\nWaiting for Pico to connect...")
-print("Press Ctrl+C to stop\n")
+async def main():
+    logging.info(f"Starting WebSocket server on {HOST}:{PORT}")
+    if not CREDENTIALS_VALID:
+        logging.warning("!!! RUNNING WITHOUT GOOGLE CREDENTIALS !!!")
+        logging.warning("Speech recognition will not work. Clients will receive an error message.")
 
-audio_thread = threading.Thread(target=audio_server, daemon=True)
-transcript_thread = threading.Thread(target=transcript_server, daemon=True)
-recognition_thread = threading.Thread(target=recognize_speech, daemon=True)
+    async with websockets.serve(handler, HOST, PORT):
+        await asyncio.Future()  # Run forever
 
-audio_thread.start()
-transcript_thread.start()
-recognition_thread.start()
-
-# Keep main thread alive
-try:
-    while True:
-        import time
-        time.sleep(1)
-except KeyboardInterrupt:
-    print("\n\nStopping server...")
-    print("Goodbye!")
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nStopping server...")
