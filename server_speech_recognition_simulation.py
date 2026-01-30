@@ -5,12 +5,12 @@ This server receives audio from a Web Browser via WebSockets,
 processes it with Google Speech-to-Text API, and sends back transcripts.
 
 Requirements:
-- pip install google-cloud-speech websockets
+- pip install google-cloud-speech websockets google-api-core
 - Google Cloud Speech-to-Text API enabled
-- Service account JSON key file
+- API Key from Google Cloud Console
 
 Usage:
-1. Update GOOGLE_APPLICATION_CREDENTIALS path below
+1. Set your API key in the GOOGLE_API_KEY variable below (or use environment variable)
 2. Run: python server_speech_recognition_simulation.py
 3. Open the web simulation app
 """
@@ -25,6 +25,7 @@ import websockets
 # Try importing google.cloud.speech, handle failure gracefully
 try:
     from google.cloud import speech
+    from google.api_core.client_options import ClientOptions
     GOOGLE_IMPORT_SUCCESS = True
 except ImportError:
     GOOGLE_IMPORT_SUCCESS = False
@@ -39,7 +40,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 RATE = 16000
 HOST = "0.0.0.0"
 PORT = 8000
-CREDENTIALS_FILE = "speech_key.json"
+# Set your Google Cloud API key here or use the GOOGLE_API_KEY environment variable
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "YOUR_API_KEY_HERE")
 
 # -------------------------------
 # CLIENT SETUP
@@ -55,13 +57,13 @@ def setup_google_client():
         logging.error("Google Cloud Speech library not found.")
         return
 
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    cred_path = os.path.join(current_dir, CREDENTIALS_FILE)
+    api_key = GOOGLE_API_KEY
     
-    if os.path.exists(cred_path):
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
+    if api_key and api_key != "YOUR_API_KEY_HERE":
         try:
-            client = speech.SpeechClient()
+            # Create client with API key
+            client_options = ClientOptions(api_key=api_key)
+            client = speech.SpeechClient(client_options=client_options)
             streaming_config = speech.StreamingRecognitionConfig(
                 config=speech.RecognitionConfig(
                     encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
@@ -72,12 +74,12 @@ def setup_google_client():
                 interim_results=True
             )
             CREDENTIALS_VALID = True
-            logging.info("Google Cloud Speech Client successfully initialized.")
+            logging.info("Google Cloud Speech Client successfully initialized with API key.")
         except Exception as e:
             logging.error(f"Failed to initialize Google Cloud Speech Client: {e}")
             CREDENTIALS_VALID = False
     else:
-        logging.warning(f"Google Cloud credentials file not found at {cred_path}")
+        logging.warning("Google Cloud API key not configured. Set GOOGLE_API_KEY environment variable or update the script.")
         CREDENTIALS_VALID = False
 
 # Initialize client on module load
