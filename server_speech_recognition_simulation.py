@@ -22,6 +22,7 @@ import threading
 import json
 import logging
 import websockets
+import time
 # Try importing google.cloud.speech, handle failure gracefully
 try:
     from google.cloud import speech
@@ -40,8 +41,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 RATE = 16000
 HOST = "0.0.0.0"
 PORT = 8000
+AUDIO_TIMEOUT_SECONDS = 5  # Close recognition if no audio for this many seconds
 # Set your Google Cloud API key here or use the GOOGLE_API_KEY environment variable
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "YOUR_API_KEY_HERE")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyCzTzNFjTZt3ZNOSLBJQ-nOx0Pfk3X4k50")
 
 # -------------------------------
 # CLIENT SETUP
@@ -85,60 +87,65 @@ def setup_google_client():
 # Initialize client on module load
 setup_google_client()
 
-class SpeechProcessor:
-    def __init__(self, loop):
+
+class RecognitionSession:
+    """Handles a single speech recognition session (one recording)"""
+    def __init__(self, loop, transcript_queue):
         self.loop = loop
+        self.transcript_queue = transcript_queue
         self.audio_queue = queue.Queue()
-        self.transcript_queue = asyncio.Queue()
         self.is_running = False
         self._thread = None
-        self._sent_error = False
+        self._last_audio_time = None
 
     def start(self):
         self.is_running = True
+        self._last_audio_time = time.time()
         self._thread = threading.Thread(target=self._process_speech, daemon=True)
         self._thread.start()
+        logging.info("Recognition session started")
 
     def stop(self):
         self.is_running = False
         self.audio_queue.put(None)  # Sentinel to stop generator
+        logging.info("Recognition session stopped")
 
     def add_audio(self, data):
         if self.is_running:
+            self._last_audio_time = time.time()
             self.audio_queue.put(data)
 
     def _audio_generator(self):
+        """Generate audio chunks for Google Speech API with timeout handling"""
         while self.is_running:
-            data = self.audio_queue.get()
-            if data is None:
-                return
-            yield speech.StreamingRecognizeRequest(audio_content=data)
+            try:
+                # Short timeout to check for inactivity
+                data = self.audio_queue.get(timeout=0.1)
+                if data is None:
+                    logging.info("Audio generator received stop signal")
+                    return
+                yield speech.StreamingRecognizeRequest(audio_content=data)
+            except queue.Empty:
+                # Check if we've been idle too long
+                if self._last_audio_time and (time.time() - self._last_audio_time) > AUDIO_TIMEOUT_SECONDS:
+                    logging.info(f"No audio for {AUDIO_TIMEOUT_SECONDS}s, ending recognition session")
+                    return
+                continue
 
     def _process_speech(self):
-        logging.info("Speech recognition thread started")
-        
-        # If no credentials, just drain queue and send error once
         if not CREDENTIALS_VALID or not client:
-            if not self._sent_error:
-                # Notify frontend of missing credentials
-                self.loop.call_soon_threadsafe(
-                    self.transcript_queue.put_nowait,
-                    json.dumps({
-                        "error": "Missing Google Cloud Credentials. Server is running in simulation mode (no STT).",
-                        "transcript": "[System: No Credentials - Speech Recognition Disabled]",
-                        "isFinal": True
-                    })
-                )
-                self._sent_error = True
-            
-            # Drain queue to prevent memory leak
-            while self.is_running:
-                data = self.audio_queue.get()
-                if data is None: 
-                    break
+            self.loop.call_soon_threadsafe(
+                self.transcript_queue.put_nowait,
+                json.dumps({
+                    "error": "Missing Google Cloud Credentials.",
+                    "transcript": "[System: No Credentials]",
+                    "isFinal": True
+                })
+            )
             return
 
         try:
+            logging.info("Starting Google Speech recognition...")
             responses = client.streaming_recognize(
                 streaming_config,
                 self._audio_generator()
@@ -158,7 +165,6 @@ class SpeechProcessor:
                 transcript = result.alternatives[0].transcript
                 is_final = result.is_final
 
-                # Send back to main loop via thread-safe call
                 self.loop.call_soon_threadsafe(
                     self.transcript_queue.put_nowait,
                     json.dumps({
@@ -166,53 +172,94 @@ class SpeechProcessor:
                         "isFinal": is_final
                     })
                 )
+                
+            logging.info("Recognition stream ended normally")
 
         except Exception as e:
-            logging.error(f"Recognition error: {e}")
-            # Notify frontend of error
-            self.loop.call_soon_threadsafe(
-                self.transcript_queue.put_nowait,
-                json.dumps({"error": str(e)})
-            )
+            error_msg = str(e)
+            logging.error(f"Recognition error: {error_msg}")
+            # Only send error to frontend if it's not a normal timeout
+            if "Audio Timeout" not in error_msg:
+                self.loop.call_soon_threadsafe(
+                    self.transcript_queue.put_nowait,
+                    json.dumps({"error": error_msg})
+                )
+
+
+class ConnectionHandler:
+    """Handles a single WebSocket connection"""
+    def __init__(self, websocket, loop):
+        self.websocket = websocket
+        self.loop = loop
+        self.transcript_queue = asyncio.Queue()
+        self.current_session = None
+        self.last_stop_time = 0  # Track when recording was stopped
+        self.STOP_GRACE_PERIOD = 0.5  # Ignore audio for this many seconds after STOP
+        
+    async def handle(self):
+        logging.info(f"Client connected: {self.websocket.remote_address}")
+        
+        # Task to send transcripts back to client
+        sender_task = asyncio.create_task(self._sender())
+
+        try:
+            async for message in self.websocket:
+                if isinstance(message, bytes):
+                    # Audio data received
+                    current_time = time.time()
+                    
+                    # Ignore audio during grace period after stop
+                    if current_time - self.last_stop_time < self.STOP_GRACE_PERIOD:
+                        logging.debug("Ignoring audio during grace period")
+                        continue
+                    
+                    if self.current_session is None:
+                        # Start new recognition session on first audio
+                        logging.info("Creating new recognition session...")
+                        self.current_session = RecognitionSession(self.loop, self.transcript_queue)
+                        self.current_session.start()
+                    elif not self.current_session.is_running:
+                        # Previous session ended, start a new one
+                        logging.info("Previous session ended, creating new one...")
+                        self.current_session = RecognitionSession(self.loop, self.transcript_queue)
+                        self.current_session.start()
+                    
+                    self.current_session.add_audio(message)
+                else:
+                    # Text message - could be control commands
+                    logging.info(f"Received text message: {message}")
+                    if message == "STOP_RECORDING":
+                        self.last_stop_time = time.time()  # Start grace period
+                        if self.current_session:
+                            self.current_session.stop()
+                            self.current_session = None  # Clear the session so next audio creates new one
+                            logging.info("Session cleared, ready for new recording")
+
+        except websockets.exceptions.ConnectionClosed:
+            logging.info("Client disconnected")
+        except Exception as e:
+            logging.error(f"Handler error: {e}")
         finally:
-            logging.info("Speech recognition thread stopped")
+            if self.current_session:
+                self.current_session.stop()
+            sender_task.cancel()
+            logging.info("Cleaned up connection")
 
-
-async def handler(websocket):
-    logging.info(f"Client connected: {websocket.remote_address}")
-    loop = asyncio.get_running_loop()
-    processor = SpeechProcessor(loop)
-    processor.start()
-
-    # Task to send transcripts back to client
-    async def sender():
+    async def _sender(self):
         try:
             while True:
-                msg = await processor.transcript_queue.get()
-                await websocket.send(msg)
+                msg = await self.transcript_queue.get()
+                await self.websocket.send(msg)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logging.error(f"Sender error: {e}")
 
-    sender_task = asyncio.create_task(sender())
 
-    try:
-        async for message in websocket:
-            # Assume binary message is audio
-            if isinstance(message, bytes):
-                processor.add_audio(message)
-            else:
-                logging.info(f"Received text message: {message}")
+async def handler(websocket):
+    connection = ConnectionHandler(websocket, asyncio.get_running_loop())
+    await connection.handle()
 
-    except websockets.exceptions.ConnectionClosed:
-        logging.info("Client disconnected")
-    except Exception as e:
-        logging.error(f"Handler error: {e}")
-    finally:
-        processor.stop()
-        sender_task.cancel()
-        logging.info("Cleaned up connection")
 
 async def main():
     logging.info(f"Starting WebSocket server on {HOST}:{PORT}")

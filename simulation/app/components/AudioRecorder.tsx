@@ -66,18 +66,47 @@ export default function AudioRecorder({ onTranscript, onError, onStatusChange }:
             if (!navigator || !navigator.mediaDevices) {
                 throw new Error("Microphone access is not supported. Ensure you are using HTTPS or localhost.");
             }
+
+            console.log('Requesting microphone access...');
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+            console.log('Microphone access granted');
+
+            // Check for supported mimeType
+            let mimeType = 'audio/webm;codecs=opus';
+            if (!MediaRecorder.isTypeSupported(mimeType)) {
+                mimeType = 'audio/webm';
+                if (!MediaRecorder.isTypeSupported(mimeType)) {
+                    mimeType = ''; // Let browser choose
+                }
+            }
+            console.log('Using mimeType:', mimeType || 'browser default');
+
+            const mediaRecorder = mimeType
+                ? new MediaRecorder(stream, { mimeType })
+                : new MediaRecorder(stream);
 
             mediaRecorderRef.current = mediaRecorder;
 
+            let chunkCount = 0;
             mediaRecorder.ondataavailable = async (event) => {
                 if (event.data.size > 0 && socketRef.current?.readyState === WebSocket.OPEN) {
+                    chunkCount++;
+                    console.log(`Sending audio chunk #${chunkCount}, size: ${event.data.size} bytes`);
                     socketRef.current.send(event.data);
+                } else {
+                    console.log('Audio chunk not sent:', {
+                        dataSize: event.data.size,
+                        socketState: socketRef.current?.readyState
+                    });
                 }
             };
 
-            mediaRecorder.start(250); // Send chunks every 250ms
+            mediaRecorder.onerror = (event) => {
+                console.error('MediaRecorder error:', event);
+            };
+
+            mediaRecorder.start(100); // Send chunks every 100ms for faster response
+            console.log('MediaRecorder started');
             setIsRecording(true);
             onStatusChange('recording');
         } catch (err) {
@@ -88,14 +117,28 @@ export default function AudioRecorder({ onTranscript, onError, onStatusChange }:
 
     const stopRecording = () => {
         if (mediaRecorderRef.current && isRecording) {
+            console.log('Stopping recording...');
+
+            // Set up onstop handler to send STOP_RECORDING after all chunks are flushed
+            mediaRecorderRef.current.onstop = () => {
+                console.log('MediaRecorder fully stopped');
+                // Small delay to ensure last chunk is processed
+                setTimeout(() => {
+                    if (socketRef.current?.readyState === WebSocket.OPEN) {
+                        socketRef.current.send('STOP_RECORDING');
+                        console.log('Sent STOP_RECORDING to server');
+                        onStatusChange('connected');
+                    } else {
+                        onStatusChange('disconnected');
+                    }
+                }, 100);
+            };
+
+            // Stop the media recorder - this will trigger final ondataavailable then onstop
             mediaRecorderRef.current.stop();
             mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+
             setIsRecording(false);
-            if (socketRef.current?.readyState === WebSocket.OPEN) {
-                onStatusChange('connected');
-            } else {
-                onStatusChange('disconnected');
-            }
         }
     };
 
