@@ -6,9 +6,10 @@ interface AudioRecorderProps {
     onTranscript: (text: string, isFinal: boolean) => void;
     onError: (error: string) => void;
     onStatusChange: (status: 'disconnected' | 'connecting' | 'connected' | 'recording') => void;
+    onSessionStart?: () => void;  // Called when a new recording session begins
 }
 
-export default function AudioRecorder({ onTranscript, onError, onStatusChange }: AudioRecorderProps) {
+export default function AudioRecorder({ onTranscript, onError, onStatusChange, onSessionStart }: AudioRecorderProps) {
     const [isRecording, setIsRecording] = useState(false);
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const socketRef = useRef<WebSocket | null>(null);
@@ -109,6 +110,11 @@ export default function AudioRecorder({ onTranscript, onError, onStatusChange }:
             console.log('MediaRecorder started');
             setIsRecording(true);
             onStatusChange('recording');
+
+            // Signal that a new session has started
+            if (onSessionStart) {
+                onSessionStart();
+            }
         } catch (err) {
             console.error('Error accessing microphone:', err);
             onError('Could not access microphone.');

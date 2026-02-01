@@ -76,6 +76,7 @@ export default function Home() {
                                         onTranscript={handleTranscript}
                                         onError={(err) => setError(err)}
                                         onStatusChange={setStatus}
+                                        onSessionStart={() => setTranscript('')}
                                     />
                                 </div>
                             </div>
