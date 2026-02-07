@@ -5,7 +5,7 @@ Tests the SSD1306 OLED display via I2C.
 If working, you should see text on the display.
 """
 
-from machine import Pin, I2C
+from machine import Pin, SoftI2C
 import time
 
 # Try to import ssd1306
@@ -17,11 +17,12 @@ except ImportError:
     raise
 
 # PINS - adjust if needed
-SCL_PIN = 1
-SDA_PIN = 0
+SCL_PIN = 5
+SDA_PIN = 4
 
-print("Initializing I2C...")
-i2c = I2C(0, scl=Pin(SCL_PIN), sda=Pin(SDA_PIN), freq=400000)
+print("Initializing SoftI2C...")
+# Use SoftI2C for better compatibility, lower freq for stability
+i2c = SoftI2C(scl=Pin(SCL_PIN), sda=Pin(SDA_PIN), freq=200000)
 
 # Scan for I2C devices
 devices = i2c.scan()
@@ -38,25 +39,22 @@ else:
         # Clear screen
         oled.fill(0)
         
-        # Display test text
-        oled.text("OLED Test OK!", 0, 0)
-        oled.text("Line 2", 0, 16)
-        oled.text("Line 3", 0, 32)
-        oled.text("Line 4", 0, 48)
+        # Display "Hello World"
+        oled.text("Hello", 30, 10)
+        oled.text("World!", 30, 25)
+        
+        # Draw a rectangle box around it
+        oled.rect(10, 5, 108, 40, 1)
+        
         oled.show()
         
-        print("SUCCESS: OLED should display text now!")
+        print("SUCCESS: You should see 'Hello World' on the OLED now!")
         
-        # Animation test
-        print("Running animation test...")
-        for i in range(5):
-            oled.fill(0)
-            oled.text(f"Count: {i}", 0, 0)
-            oled.show()
-            time.sleep(0.5)
+        # Keep it on screen for 5 seconds
+        time.sleep(5)
         
         oled.fill(0)
-        oled.text("Test Complete!", 0, 0)
+        oled.text("Test Complete", 10, 30)
         oled.show()
         print("OLED test complete!")
         

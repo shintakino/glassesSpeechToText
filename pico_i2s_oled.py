@@ -34,8 +34,8 @@ UART_BAUD = 115200
 SCK_PIN = 16   # I2S Serial Clock
 WS_PIN = 17    # I2S Word Select
 SD_PIN = 18    # I2S Serial Data
-SCL_PIN = 1    # I2C Clock for OLED
-SDA_PIN = 0    # I2C Data for OLED
+SCL_PIN = 5    # I2C Clock for OLED
+SDA_PIN = 4    # I2C Data for OLED
 BUTTON_PIN = 14  # Button to start/stop recording
 
 # AUDIO
@@ -59,11 +59,47 @@ button = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)
 esp_uart = UART(UART_ID, UART_BAUD)
 
 # OLED
-i2c = I2C(0, scl=Pin(SCL_PIN), sda=Pin(SDA_PIN), freq=400000)
-oled = None
+display_status = lambda *args: None # Fallback
+display_transcript = lambda *args: None
+
 try:
+    from machine import SoftI2C
+    i2c = SoftI2C(scl=Pin(SCL_PIN), sda=Pin(SDA_PIN), freq=200000)
+    oled = None
     if ssd1306:
         oled = ssd1306.SSD1306_I2C(128, 64, i2c)
+        
+    # Re-enable display functions if OLED present
+    def display_status(line1, line2="", line3=""):
+        """Display status on OLED"""
+        print(f"Display: {line1} | {line2} | {line3}")
+        if not oled: return
+        oled.fill(0)
+        oled.text(line1[:16], 0, 0)
+        if line2: oled.text(line2[:16], 0, 16)
+        if line3: oled.text(line3[:16], 0, 32)
+        oled.show()
+
+    def display_transcript(text):
+        """Display transcript with word wrapping"""
+        print(f"Transcript: {text}")
+        if not oled: return
+        oled.fill(0)
+        words = text.split()
+        lines = []
+        current_line = ""
+        for word in words:
+            test_line = current_line + " " + word if current_line else word
+            if len(test_line) <= 16:
+                current_line = test_line
+            else:
+                lines.append(current_line)
+                current_line = word
+        if current_line: lines.append(current_line)
+        for i, line in enumerate(lines[:8]):
+            oled.text(line, 0, i * 8)
+        oled.show()
+        
 except Exception as e:
     print(f"OLED Init Error: {e}")
 
@@ -420,24 +456,38 @@ def main():
     
     print("Ready! Press button to start/stop recording.")
     
+    # Button state
+    button_was_pressed = False 
+    last_press_time = 0 
+    DEBOUNCE_MS = 50 
+
     while True:
         try:
-            # Check button press
-            if check_button():
-                if is_recording:
-                    # Stop recording
-                    is_recording = False
-                    led.off()
-                    client.send_stop()
-                    display_status("Stopped", "Press button", "to record")
-                    print("Recording stopped")
-                else:
-                    # Start recording
-                    is_recording = True
-                    led.on()
-                    last_transcript = ""
-                    display_status("Recording...", "Speak now")
-                    print("Recording started")
+            # Check button (Active LOW)
+            if button.value() == 0:
+                current_time = utime.ticks_ms()
+                if not button_was_pressed and utime.ticks_diff(current_time, last_press_time) > DEBOUNCE_MS:
+                    last_press_time = current_time
+                    button_was_pressed = True
+                    
+                    if is_recording:
+                        # Stop recording
+                        is_recording = False
+                        led.off()
+                        client.send_stop()
+                        display_status("Stopped", "Press button", "to record")
+                        print("Recording stopped")
+                    else:
+                        # Start recording
+                        is_recording = True
+                        led.on()
+                        last_transcript = ""
+                        display_status("Recording...", "Speak now")
+                        print("Recording started")
+            else:
+                # Button released
+                button_was_pressed = False
+
             
             # If recording, capture and send audio
             if is_recording:
