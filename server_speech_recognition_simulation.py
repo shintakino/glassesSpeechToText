@@ -43,7 +43,7 @@ HOST = "0.0.0.0"
 PORT = 8000
 AUDIO_TIMEOUT_SECONDS = 5  # Close recognition if no audio for this many seconds
 # Set your Google Cloud API key here or use the GOOGLE_API_KEY environment variable
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyCzTzNFjTZt3ZNOSLBJQ-nOx0Pfk3X4k50")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "Your-API-Key")
 
 # -------------------------------
 # CLIENT SETUP

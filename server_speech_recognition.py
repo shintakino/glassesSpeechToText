@@ -61,7 +61,7 @@ if os.path.exists(cred_path):
 
 # Option 2: API Key (set via environment variable or below)
 if not CREDENTIALS_VALID:
-    GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyCzTzNFjTZt3ZNOSLBJQ-nOx0Pfk3X4k50")
+    GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "Your-API-Key")
     if GOOGLE_API_KEY and GOOGLE_API_KEY != "YOUR_API_KEY_HERE":
         try:
             client_options = ClientOptions(api_key=GOOGLE_API_KEY)
