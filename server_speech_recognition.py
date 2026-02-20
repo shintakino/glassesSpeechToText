@@ -256,65 +256,80 @@ def audio_server():
     while True:
         try:
             conn, addr = server_sock.accept()
+            conn.settimeout(5.0) # Set timeout to detect dead connections
             
             # Check client type
-            client_type = conn.recv(10).decode('utf-8')
-            if client_type.startswith("AUDIO"):
-                print(f"Audio client connected from {addr}")
-                pico_handler.audio_sock = conn
-                
-                # Receive audio data
-                while True:
-                    try:
-                        # Read length header (4 bytes)
-                        length_bytes = conn.recv(4)
-                        if len(length_bytes) != 4:
-                            break
-                        
-                        length = struct.unpack('<I', length_bytes)[0]
-                        
-                        # Check for special text message marker
-                        if length == 0xFFFFFFFF:
-                            # Read text message length
-                            text_len_bytes = conn.recv(4)
-                            if len(text_len_bytes) != 4:
+            try:
+                client_type = conn.recv(10).decode('utf-8')
+                if client_type.startswith("AUDIO"):
+                    print(f"Audio client connected from {addr}")
+                    pico_handler.audio_sock = conn
+                    
+                    # Receive audio data
+                    while True:
+                        try:
+                            # Read length header (4 bytes)
+                            length_bytes = conn.recv(4)
+                            if not length_bytes:
                                 break
-                            text_len = struct.unpack('<I', text_len_bytes)[0]
+                            if len(length_bytes) != 4:
+                                break
                             
-                            # Read text message
-                            text_data = b''
-                            while len(text_data) < text_len:
-                                chunk = conn.recv(text_len - len(text_data))
+                            length = struct.unpack('<I', length_bytes)[0]
+                            
+                            # Check for special text message marker
+                            if length == 0xFFFFFFFF:
+                                # Read text message length
+                                text_len_bytes = conn.recv(4)
+                                if len(text_len_bytes) != 4:
+                                    break
+                                text_len = struct.unpack('<I', text_len_bytes)[0]
+                                
+                                # Read text message
+                                text_data = b''
+                                while len(text_data) < text_len:
+                                    chunk = conn.recv(text_len - len(text_data))
+                                    if not chunk:
+                                        break
+                                    text_data += chunk
+                                
+                                message = text_data.decode('utf-8')
+                                if message == "STOP_RECORDING":
+                                    pico_handler.handle_stop()
+                                continue
+                            
+                            # Read audio data
+                            audio_data = b''
+                            while len(audio_data) < length:
+                                chunk = conn.recv(length - len(audio_data))
                                 if not chunk:
                                     break
-                                text_data += chunk
+                                audio_data += chunk
                             
-                            message = text_data.decode('utf-8')
-                            if message == "STOP_RECORDING":
-                                pico_handler.handle_stop()
+                            if len(audio_data) == length:
+                                pico_handler.handle_audio(audio_data)
+                                
+                        except socket.timeout:
+                            # Timeout is fine, just loop back and check if we should still run
                             continue
-                        
-                        # Read audio data
-                        audio_data = b''
-                        while len(audio_data) < length:
-                            chunk = conn.recv(length - len(audio_data))
-                            if not chunk:
-                                break
-                            audio_data += chunk
-                        
-                        if len(audio_data) == length:
-                            pico_handler.handle_audio(audio_data)
-                            
-                    except Exception as e:
-                        print(f"Error receiving audio: {e}")
-                        break
-                
-                print("Audio client disconnected")
-                pico_handler.cleanup()
-                pico_handler.audio_sock = None
+                        except Exception as e:
+                            print(f"Error receiving audio: {e}")
+                            break
+                    
+                    print("Audio client disconnected")
+                    pico_handler.cleanup()
+                    pico_handler.audio_sock = None
+                    conn.close()
+                else:
+                    conn.close()
+
+            except Exception as e:
+                print(f"Handshake error: {e}")
+                conn.close()
                 
         except Exception as e:
             print(f"Audio server error: {e}")
+            time.sleep(1)
 
 def transcript_server():
     """Server to send transcripts to Pico"""
@@ -328,29 +343,38 @@ def transcript_server():
     while True:
         try:
             conn, addr = server_sock.accept()
+            conn.settimeout(5.0)
             
-            # Check client type
-            client_type = conn.recv(15).decode('utf-8')
-            if client_type.startswith("TRANSCRIPT"):
-                print(f"Transcript client connected from {addr}")
-                pico_handler.transcript_sock = conn
-                
-                # Keep connection alive
-                while pico_handler.transcript_sock:
-                    try:
-                        time.sleep(30)
-                        if pico_handler.transcript_sock:
-                            # Send 0 length packet as keepalive
-                            pico_handler.transcript_sock.send(struct.pack('<I', 0))
-                    except Exception as e:
-                        print(f"Keepalive error: {e}")
-                        break
-                
-                print("Transcript client disconnected")
-                pico_handler.transcript_sock = None
+            try:
+                # Check client type
+                client_type = conn.recv(15).decode('utf-8')
+                if client_type.startswith("TRANSCRIPT"):
+                    print(f"Transcript client connected from {addr}")
+                    pico_handler.transcript_sock = conn
+                    
+                    # Keep connection alive
+                    while pico_handler.transcript_sock:
+                        try:
+                            time.sleep(5) # Send keepalive more frequently
+                            if pico_handler.transcript_sock:
+                                # Send 0 length packet as keepalive
+                                pico_handler.transcript_sock.send(struct.pack('<I', 0))
+                        except Exception as e:
+                            print(f"Keepalive error: {e}")
+                            break
+                    
+                    print("Transcript client disconnected")
+                    pico_handler.transcript_sock = None
+                    conn.close()
+                else:
+                    conn.close()
+            except Exception as e:
+                print(f"Transcript handshake error: {e}")
+                conn.close()
                 
         except Exception as e:
             print(f"Transcript server error: {e}")
+            time.sleep(1)
 
 # -------------------------------
 # GET LOCAL IP ADDRESS

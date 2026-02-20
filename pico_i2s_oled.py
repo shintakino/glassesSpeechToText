@@ -1,525 +1,727 @@
 """
 Speech Recognition Client for Pico with ESP8285 WiFi
 -----------------------------------------------------
-This script runs on a Pico clone with ESP8285 WiFi chip.
-Uses UART AT commands for WiFi communication.
-Features button-controlled recording with I2S microphone.
+Root cause of missing transcripts — definitively identified:
+
+  audio_in.readinto() BLOCKS for ~50ms waiting for the I2S DMA buffer.
+  The ESP8285 hardware UART RX FIFO is only 128 bytes.
+  During the 50ms block the ESP receives +IPD transcript bytes from the
+  server, fills the 128-byte FIFO, then DROPS the rest — silently.
+  By the time readinto() returns and check_transcript() runs, the +IPD
+  frame is gone.
+
+Fix:
+  1. Use I2S readinto() with a small internal buffer and poll it in a
+     tight loop using utime so we never block longer than ~5ms at a time.
+     This keeps the UART FIFO drained continuously.
+  2. Accumulate audio into a staging buffer until we have CHUNK_SAMPLES
+     worth of data, then send it.
+  3. check_transcript() is called every ~5ms instead of every ~85ms.
 """
 
-from machine import UART, Pin, I2S, I2C
+from machine import UART, Pin, I2S
 import utime
 import time
 import struct
+import _thread  # KEY: Multi-core support
 
-# Try to import ssd1306, handle if missing
+try:
+    from machine import SoftI2C
+    _HAS_SOFTI2C = True
+except ImportError:
+    _HAS_SOFTI2C = False
+
 try:
     import ssd1306
 except ImportError:
     ssd1306 = None
 
-# -------------------------------
+# ---------------------------------------------------------------
 # CONFIGURATION
-# -------------------------------
-# WIFI
-WIFI_SSID = "YOUR_WIFI_SSID"
+# ---------------------------------------------------------------
+WIFI_SSID     = "YOUR_WIFI_SSID"
 WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
-SERVER_IP = "192.168.1.100"  # Update with your computer's IP
-SERVER_PORT = 5000
+SERVER_IP     = "192.168.1.100"
+SERVER_PORT   = 5000
 
-# UART for ESP8285
-UART_ID = 0
+UART_ID   = 0
 UART_BAUD = 115200
 
-# PINS
-SCK_PIN = 16   # I2S Serial Clock
-WS_PIN = 17    # I2S Word Select
-SD_PIN = 18    # I2S Serial Data
-SCL_PIN = 5    # I2C Clock for OLED
-SDA_PIN = 4    # I2C Data for OLED
-BUTTON_PIN = 14  # Button to start/stop recording
+SCK_PIN    = 16
+WS_PIN     = 17
+SD_PIN     = 18
+SCL_PIN    =  5
+SDA_PIN    =  4
+BUTTON_PIN = 14
 
-# AUDIO
-SAMPLE_RATE = 16000
+SAMPLE_RATE     = 16000
 BITS_PER_SAMPLE = 16
-BUFFER_LENGTH = 1600  # 0.1s chunks
 
-# -------------------------------
-# HARDWARE SETUP
-# -------------------------------
-# LED
+# Audio is accumulated in a staging buffer. We send once we have
+# SEND_SAMPLES worth of PCM. At 16kHz, 800 samples = 50ms audio.
+# The I2S readinto() polls in READ_SAMPLES chunks — small enough
+# that we never block longer than READ_MS milliseconds.
+READ_SAMPLES  = 128    # one I2S read = 256 bytes, ~8ms — keeps FIFO drained
+SEND_SAMPLES  = 800    # accumulate to 1600 bytes before sending (50ms audio)
+
+ESP_MAX_SEND  = 2048
+DEBOUNCE_MS   = 300
+
+# ---------------------------------------------------------------
+# HARDWARE
+# ---------------------------------------------------------------
 try:
     led = Pin("LED", Pin.OUT)
 except:
-    led = Pin(25, Pin.OUT)  # Fallback
+    led = Pin(25, Pin.OUT)
 
-# Button with internal pull-up
-button = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)
-
-# UART for ESP8285
+button   = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)
 esp_uart = UART(UART_ID, UART_BAUD)
 
-# OLED
-display_status = lambda *args: None # Fallback
-display_transcript = lambda *args: None
+# ---------------------------------------------------------------
+# OLED (CORE 1)
+# ---------------------------------------------------------------
+# Shared state between Core 0 (Main) and Core 1 (Display)
+shared_oled_status = None   # (line1, line2, line3)
+shared_oled_text   = None   # "Transcription..."
+oled_lock          = _thread.allocate_lock()
 
-try:
-    from machine import SoftI2C
-    i2c = SoftI2C(scl=Pin(SCL_PIN), sda=Pin(SDA_PIN), freq=200000)
+def oled_thread_entry():
+    """
+    Runs on Core 1. Handles all OLED drawing independently.
+    Checks shared variables and updates screen if changed.
+    """
+    global shared_oled_status, shared_oled_text
+    print("Core 1: OLED Thread Started")
     oled = None
-    if ssd1306:
-        oled = ssd1306.SSD1306_I2C(128, 64, i2c)
-        
-    # Re-enable display functions if OLED present
-    def display_status(line1, line2="", line3=""):
-        """Display status on OLED"""
-        print(f"Display: {line1} | {line2} | {line3}")
-        if not oled: return
-        oled.fill(0)
-        oled.text(line1[:16], 0, 0)
-        if line2: oled.text(line2[:16], 0, 16)
-        if line3: oled.text(line3[:16], 0, 32)
-        oled.show()
+    
+    if _HAS_SOFTI2C and ssd1306:
+        try:
+            # Initialize I2C and OLED on Core 1 to avoid conflicts
+            i2c = SoftI2C(scl=Pin(SCL_PIN), sda=Pin(SDA_PIN), freq=400000) # Faster I2C
+            oled = ssd1306.SSD1306_I2C(128, 64, i2c)
+            oled.fill(0)
+            oled.text("OLED Ready", 0, 0)
+            oled.show()
+        except Exception as e:
+            print(f"Core 1 Error: {e}")
+            return
 
-    def display_transcript(text):
-        """Display transcript with word wrapping"""
-        print(f"Transcript: {text}")
-        if not oled: return
-        oled.fill(0)
-        words = text.split()
-        lines = []
-        current_line = ""
-        for word in words:
-            test_line = current_line + " " + word if current_line else word
-            if len(test_line) <= 16:
-                current_line = test_line
-            else:
-                lines.append(current_line)
-                current_line = word
-        if current_line: lines.append(current_line)
-        for i, line in enumerate(lines[:8]):
-            oled.text(line, 0, i * 8)
-        oled.show()
-        
-except Exception as e:
-    print(f"OLED Init Error: {e}")
+    last_status = None
+    last_text   = None
 
-# I2S Microphone
+    while True:
+        # 1. Check for STATUS update (Highest priority overlay)
+        current_status = shared_oled_status
+        if current_status != last_status:
+            if oled:
+                oled.fill(0)
+                l1, l2, l3 = current_status
+                oled.text(l1[:16], 0, 0)
+                if l2: oled.text(l2[:16], 0, 16)
+                if l3: oled.text(l3[:16], 0, 32)
+                oled.show()
+            last_status = current_status
+            last_text   = "" # Invalidate text so it redraws if status clears? 
+                             # Actually usually status IS the screen. 
+                             # If we switch back to text, status becomes None?
+        
+        # 2. Check for TRANSCRIPT update (Only if no active status like 'Recording')
+        #    Actually, we want to show transcript WHILE recording.
+        #    So 'Recording...' status is just a transient state?
+        #    No, display_status is used for 'Recording...'.
+        #    We need a mechanism to know if we are in 'Text Mode'.
+        
+        # IMPROVED LOGIC:
+        # If shared_oled_text is updated, we show it.
+        # If shared_oled_status is updated, we show it.
+        # Whichever changed LAST is what we show?
+        
+        # Simple approach:
+        # Main loop clears status when showing text?
+        # display_transcript() -> sets status=None, text="..."
+        
+        current_text = shared_oled_text
+        if current_text and current_text != last_text:
+            # New text available
+            if oled:
+                oled.fill(0)
+                # Word wrap logic
+                words, lines, cur = current_text.split(), [], ""
+                for w in words:
+                    test = (cur + " " + w) if cur else w
+                    if len(test) <= 16:
+                        cur = test
+                    else:
+                        lines.append(cur)
+                        cur = w
+                if cur: lines.append(cur)
+                
+                for i, ln in enumerate(lines[:8]):
+                    oled.text(ln, 0, i * 8)
+                oled.show()
+            
+            last_text = current_text
+            # We don't clear status, we just overwrote the screen.
+            # But if status changes again, it will overwrite this.
+            # Perfect.
+        
+        time.sleep_ms(50) # check 20 times per second
+
+
+def display_status(line1, line2="", line3=""):
+    print(f"Display: {line1} | {line2} | {line3}")
+    global shared_oled_status, shared_oled_text
+    shared_oled_text = None  # Clear text so next text update triggers
+    shared_oled_status = (line1, line2, line3)
+
+
+def display_transcript(text):
+    print(f"TRANSCRIPT: {text}")
+    global shared_oled_text
+    # We leave status as is? No, we want to show text.
+    # We implicitly override status.
+    shared_oled_text = text
+
+
+# ---------------------------------------------------------------
+# I2S  — sized for READ_SAMPLES poll chunks
+# ---------------------------------------------------------------
 audio_in = I2S(
     0,
-    sck=Pin(SCK_PIN),
-    ws=Pin(WS_PIN),
-    sd=Pin(SD_PIN),
+    sck=Pin(SCK_PIN), ws=Pin(WS_PIN), sd=Pin(SD_PIN),
     mode=I2S.RX,
     bits=BITS_PER_SAMPLE,
     format=I2S.MONO,
     rate=SAMPLE_RATE,
-    ibuf=20000
+    ibuf=SEND_SAMPLES * 4 * 4,   # large internal DMA buffer
 )
 
-# -------------------------------
-# STATE MANAGEMENT
-# -------------------------------
-is_recording = False
-last_button_time = 0
-DEBOUNCE_MS = 300
-audio_connected = False
-transcript_connected = False
-
-# -------------------------------
-# HELPER FUNCTIONS
-# -------------------------------
-def display_status(line1, line2="", line3=""):
-    """Display status on OLED"""
-    print(f"Display: {line1} | {line2} | {line3}")
-    if not oled:
-        return
-    oled.fill(0)
-    oled.text(line1[:16], 0, 0)
-    if line2:
-        oled.text(line2[:16], 0, 16)
-    if line3:
-        oled.text(line3[:16], 0, 32)
-    oled.show()
-
-def display_transcript(text):
-    """Display transcript with word wrapping"""
-    print(f"Transcript: {text}")
-    if not oled:
-        return
-    oled.fill(0)
-    words = text.split()
-    lines = []
-    current_line = ""
-    for word in words:
-        test_line = current_line + " " + word if current_line else word
-        if len(test_line) <= 16:
-            current_line = test_line
-        else:
-            lines.append(current_line)
-            current_line = word
-    if current_line:
-        lines.append(current_line)
-    for i, line in enumerate(lines[:8]):
-        oled.text(line, 0, i * 8)
-    oled.show()
-
+# ---------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------
 def blink_led(times, delay=0.2):
     for _ in range(times):
-        led.on()
-        time.sleep(delay)
-        led.off()
-        time.sleep(delay)
+        led.on();  time.sleep(delay)
+        led.off(); time.sleep(delay)
 
-def check_button():
-    """Check if button was pressed with debounce"""
-    global last_button_time
-    if button.value() == 0:  # Active low
-        current_time = utime.ticks_ms()
-        if utime.ticks_diff(current_time, last_button_time) > DEBOUNCE_MS:
-            last_button_time = current_time
-            return True
-    return False
 
-# -------------------------------
-# ESP8285 AT COMMAND FUNCTIONS
-# -------------------------------
-def esp_send_cmd(cmd, ack="OK", timeout=5000):
-    """Send AT command and wait for acknowledgment"""
-    # Clear any pending data
-    if esp_uart.any():
+def _uart_discard_all():
+    """Drain UART RX FIFO. Only safe during init."""
+    time.sleep_ms(30)
+    while esp_uart.any():
         esp_uart.read()
-    
-    esp_uart.write(cmd + '\r\n')
-    start = utime.ticks_ms()
+        time.sleep_ms(10)
+
+
+def _drain_with_retry(ms=200):
+    """Actively drain UART for ms milliseconds — flush stale session bytes."""
+    deadline = utime.ticks_add(utime.ticks_ms(), ms)
+    while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
+        if esp_uart.any():
+            esp_uart.read()
+        time.sleep_ms(5)
+
+
+def strip_at_echo(data):
+    """
+    Strip AT command echo lines from received bytes.
+    Lines starting with 'AT', bare 'OK', bare '>' and empty lines are removed.
+    +IPD frames and payloads pass through unchanged.
+    """
+    if b"+IPD" not in data and b"\r\n" not in data:
+        return data
+    result = b""
+    i = 0
+    while i < len(data):
+        end = data.find(b"\r\n", i)
+        if end < 0:
+            result += data[i:]
+            break
+        line = data[i:end]
+        if (line.startswith(b"AT") or
+                line == b"OK" or
+                line == b"" or
+                line == b">"):
+            i = end + 2
+            continue
+        result += data[i:end + 2]
+        i = end + 2
+    return result
+
+
+# ---------------------------------------------------------------
+# AT COMMAND LAYER
+# ---------------------------------------------------------------
+def _wait_for_ack(ack, timeout):
+    """Wait for ack string. Returns (bool, str)."""
     response = ""
-    
+    start = utime.ticks_ms()
     while utime.ticks_diff(utime.ticks_ms(), start) < timeout:
         if esp_uart.any():
             chunk = esp_uart.read()
             if chunk:
-                response += chunk.decode('utf-8', 'ignore')
+                try:
+                    response += chunk.decode('utf-8', 'ignore')
+                except Exception:
+                    pass
                 if ack in response:
                     return True, response
                 if "ERROR" in response:
                     return False, response
         time.sleep_ms(10)
-    
     return False, response
 
-def esp_init():
-    """Initialize ESP8285 and connect to WiFi"""
-    display_status("Init ESP8285...")
-    
-    # Exit transparent mode if stuck
-    esp_uart.write('+++')
-    time.sleep(1)
-    if esp_uart.any():
-        esp_uart.read()
-    
-    # Test AT
-    ok, _ = esp_send_cmd("AT", "OK", 2000)
-    if not ok:
-        display_status("ESP8285 Error", "Not responding")
-        return False
-    
-    # Set WiFi mode to station
-    ok, _ = esp_send_cmd("AT+CWMODE=1", "OK")
-    if not ok:
-        display_status("ESP8285 Error", "Mode failed")
-        return False
-    
-    # Connect to WiFi
-    display_status("Connecting WiFi", WIFI_SSID[:16])
-    ok, _ = esp_send_cmd(f'AT+CWJAP="{WIFI_SSID}","{WIFI_PASSWORD}"', "OK", 20000)
-    if not ok:
-        display_status("WiFi Failed!")
-        return False
-    
-    # Set normal mode (not passthrough)
-    esp_send_cmd("AT+CIPMODE=0", "OK")
-    
-    # Enable multiple connections
-    esp_send_cmd("AT+CIPMUX=1", "OK")
-    
-    display_status("WiFi Connected!")
-    blink_led(3, 0.1)
-    return True
 
-def esp_connect_tcp(link_id, host, port, timeout=10000):
-    """Connect to TCP server"""
-    cmd = f'AT+CIPSTART={link_id},"TCP","{host}",{port}'
-    ok, response = esp_send_cmd(cmd, "OK", timeout)
-    return ok
-
-def esp_send_data(link_id, data, timeout=5000):
-    """Send data over TCP connection"""
-    length = len(data)
-    cmd = f'AT+CIPSEND={link_id},{length}'
-    
-    ok, response = esp_send_cmd(cmd, ">", 2000)
-    if not ok:
-        return False
-    
-    # Send the actual data
-    esp_uart.write(data)
-    
-    # Wait for SEND OK
+def _wait_for_prompt(timeout=3000):
+    """Wait for '>' after AT+CIPSEND. Returns (found, clean_pre_bytes)."""
+    accumulated = b""
     start = utime.ticks_ms()
     while utime.ticks_diff(utime.ticks_ms(), start) < timeout:
         if esp_uart.any():
             chunk = esp_uart.read()
-            if chunk and b"SEND OK" in chunk:
-                return True
-        time.sleep_ms(10)
-    
-    return False
+            if chunk:
+                accumulated += chunk
+                if b">" in accumulated:
+                    # Return EVERYTHING except the prompt, run through strip_at_echo
+                    return True, strip_at_echo(accumulated.replace(b">", b""))
+                if b"ERROR" in accumulated or b"link is not valid" in accumulated:
+                    return False, b""
+        time.sleep_ms(5)
+    return False, b""
+
+
+def _wait_send_ok(timeout=8000, pre_buffer=b""):
+    """Wait for SEND OK. Returns (success, clean_leftover)."""
+    accumulated = pre_buffer
+    start = utime.ticks_ms()
+    while utime.ticks_diff(utime.ticks_ms(), start) < timeout:
+        if esp_uart.any():
+            chunk = esp_uart.read()
+            if chunk:
+                accumulated += chunk
+                for marker in (b"SEND OK", b"SEND FAIL", b"link is not valid"):
+                    if marker in accumulated:
+                        # Return EVERYTHING except the marker, run through strip_at_echo
+                        cleaned = strip_at_echo(accumulated.replace(marker, b""))
+                        return marker == b"SEND OK", cleaned
+        time.sleep_ms(5)
+    print("_wait_send_ok timeout")
+    return False, b""
+
+
+def esp_send_cmd(cmd, ack="OK", timeout=5000):
+    """INIT-ONLY: flush then send AT command."""
+    _uart_discard_all()
+    esp_uart.write(cmd + '\r\n')
+    return _wait_for_ack(ack, timeout)
+
+
+def esp_send_data(link_id, data, timeout=8000):
+    """
+    Send data over link_id without flushing UART.
+    Returns (success, clean_leftover).
+    """
+    offset   = 0
+    leftover = b""
+    while offset < len(data):
+        chunk = data[offset: offset + ESP_MAX_SEND]
+        esp_uart.write(f'AT+CIPSEND={link_id},{len(chunk)}\r\n')
+        ok, pre = _wait_for_prompt(3000)
+        if pre:
+            leftover += pre
+        if not ok:
+            print(f"CIPSEND prompt failed for link {link_id}")
+            return False, leftover
+        
+        # Chunked write + RX poll
+        rx_during_tx = b""
+        c_idx = 0
+        while c_idx < len(chunk):
+            w_size = 64
+            esp_uart.write(chunk[c_idx : c_idx + w_size])
+            c_idx += w_size
+            # Poll RX to prevent FIFO overflow
+            while esp_uart.any():
+                r = esp_uart.read()
+                if r: rx_during_tx += r
+        
+        ok2, lv = _wait_send_ok(timeout, rx_during_tx)
+        if lv:
+            leftover += lv
+        if not ok2:
+            return False, leftover
+        offset += len(chunk)
+    return True, leftover
+
+
+def esp_init():
+    display_status("Init ESP8285...")
+    esp_uart.write('+++')
+    time.sleep(1)
+    _uart_discard_all()
+
+    ok, _ = esp_send_cmd("AT", "OK", 2000)
+    if not ok: display_status("ESP8285 Error", "Not responding"); return False
+
+    ok, _ = esp_send_cmd("AT+CWMODE=1", "OK")
+    if not ok: display_status("ESP8285 Error", "Mode failed"); return False
+
+    display_status("Connecting WiFi", WIFI_SSID[:16])
+    ok, _ = esp_send_cmd(f'AT+CWJAP="{WIFI_SSID}","{WIFI_PASSWORD}"', "OK", 20000)
+    if not ok: display_status("WiFi Failed!"); return False
+
+    display_status("Setting Baud...")
+    ok, _ = esp_send_cmd("AT+UART_CUR=921600,8,1,0,0", "OK", 1000)
+    if ok:
+        time.sleep_ms(150)
+        esp_uart.init(921600)
+        time.sleep_ms(100)
+        _uart_discard_all()
+        ok2, _ = esp_send_cmd("AT", "OK", 2000)
+        print("Switched to 921600 —", "confirmed OK" if ok2 else "no echo, continuing")
+    else:
+        print("Baud switch failed — staying 115200")
+
+    ok, _ = esp_send_cmd("AT+CIPMODE=0", "OK", 2000)
+    if not ok: display_status("CIPMODE failed"); return False
+
+    ok, _ = esp_send_cmd("AT+CIPMUX=1", "OK", 2000)
+    if not ok: display_status("CIPMUX failed"); return False
+
+    display_status("WiFi Connected!")
+    blink_led(3, 0.1)
+    return True
+
+
+def esp_connect_tcp(link_id, host, port, timeout=10000):
+    esp_uart.write(f'AT+CIPSTART={link_id},"TCP","{host}",{port}\r\n')
+    ok, _ = _wait_for_ack("OK", timeout)
+    return ok
+
 
 def esp_close_tcp(link_id):
-    """Close TCP connection"""
-    esp_send_cmd(f"AT+CIPCLOSE={link_id}", "OK", 2000)
+    esp_uart.write(f'AT+CIPCLOSE={link_id}\r\n')
+    _wait_for_ack("OK", 2000)
+
 
 def esp_check_data():
-    """Check for incoming data from ESP8285"""
+    """Read UART bytes, strip AT echoes, return clean bytes or None."""
     if esp_uart.any():
-        data = esp_uart.read()
-        if data:
-            return data
+        raw = esp_uart.read()
+        if raw:
+            clean = strip_at_echo(raw)
+            return clean if clean else None
     return None
 
-# -------------------------------
+
+# ---------------------------------------------------------------
 # SPEECH CLIENT
-# -------------------------------
+# ---------------------------------------------------------------
 class SpeechClient:
     def __init__(self):
-        self.audio_link = 0
+        self.audio_link      = 0
         self.transcript_link = 1
-        self.connected = False
-        self.recv_buffer = b""
-        
+        self.connected       = False
+        self.recv_buffer     = b""
+        self.recv_buffer     = b""
+        self.transcript_buffer = b""  # [NEW] Buffer for fragmented transcript stream
+        self._buf_stale_ms   = None
+
     def connect(self):
-        """Connect to speech recognition server"""
-        global audio_connected, transcript_connected
-        
         display_status("Connecting to", "server...")
-        
-        # Connect audio socket (link 0)
+        _drain_with_retry(200)
+        esp_close_tcp(self.audio_link)
+        esp_close_tcp(self.transcript_link)
+        time.sleep_ms(400)
+
         if not esp_connect_tcp(self.audio_link, SERVER_IP, SERVER_PORT):
-            display_status("Audio connect", "failed!")
-            return False
-        
-        # Send AUDIO identifier
-        if not esp_send_data(self.audio_link, b"AUDIO"):
-            display_status("Audio init", "failed!")
-            return False
-        audio_connected = True
-        
+            display_status("Audio connect", "failed!"); return False
+        time.sleep_ms(300)
+        ok, lv = esp_send_data(self.audio_link, b"AUDIO")
+        if lv: self.recv_buffer += lv
+        if not ok:
+            display_status("Audio init", "failed!"); return False
+
         time.sleep_ms(500)
-        
-        # Connect transcript socket (link 1)
+
         if not esp_connect_tcp(self.transcript_link, SERVER_IP, SERVER_PORT + 1):
             display_status("Transcript", "connect failed!")
-            return False
-        
-        # Send TRANSCRIPT identifier
-        if not esp_send_data(self.transcript_link, b"TRANSCRIPT"):
+            esp_close_tcp(self.audio_link); return False
+        time.sleep_ms(300)
+        ok, lv = esp_send_data(self.transcript_link, b"TRANSCRIPT")
+        if lv: self.recv_buffer += lv
+        if not ok:
             display_status("Transcript init", "failed!")
-            return False
-        transcript_connected = True
-        
-        self.connected = True
+            esp_close_tcp(self.audio_link)
+            esp_close_tcp(self.transcript_link); return False
+
+        self.connected     = True
+        self.recv_buffer   = b""
+        self.transcript_buffer = b""
+        self._buf_stale_ms = None
         display_status("Server OK!", "Press button", "to record")
         blink_led(2, 0.1)
         return True
-    
+
     def disconnect(self):
-        """Disconnect from server"""
         esp_close_tcp(self.audio_link)
         esp_close_tcp(self.transcript_link)
-        self.connected = False
-        
-    def send_audio(self, data):
-        """Send audio data with length header"""
+        _drain_with_retry(300)
+        self.connected     = False
+        self.recv_buffer   = b""
+        self.transcript_buffer = b""
+        self._buf_stale_ms = None
+
+    def send_audio(self, pcm_bytes):
         if not self.connected:
             return False
-        
-        # Create packet: 4-byte length header + audio data
-        header = struct.pack('<I', len(data))
-        packet = header + bytes(data)
-        
-        return esp_send_data(self.audio_link, packet, 2000)
-    
+        packet = struct.pack('<I', len(pcm_bytes)) + bytes(pcm_bytes)
+        ok, lv = esp_send_data(self.audio_link, packet)
+        if lv:
+            self.recv_buffer += lv
+        return ok
+
     def send_stop(self):
-        """Send STOP_RECORDING message"""
         if not self.connected:
             return False
-        
-        msg = b"STOP_RECORDING"
-        # Special marker (0xFFFFFFFF) + text length + text
-        header = struct.pack('<I', 0xFFFFFFFF)
-        text_header = struct.pack('<I', len(msg))
-        packet = header + text_header + msg
-        
-        return esp_send_data(self.audio_link, packet, 2000)
-    
+        msg    = b"STOP_RECORDING"
+        packet = struct.pack('<I', 0xFFFFFFFF) + struct.pack('<I', len(msg)) + msg
+        ok, lv = esp_send_data(self.audio_link, packet)
+        if lv:
+            self.recv_buffer += lv
+        return ok
+
+    def drain_uart_to_buffer(self):
+        """
+        Read all pending UART bytes into recv_buffer immediately.
+        """
+        raw = esp_check_data()
+        if raw:
+            print(f"DEBUG UART: {raw}")  # Uncomment to see ALL raw bytes
+            self.recv_buffer += raw
+
     def check_transcript(self):
-        """Check for incoming transcript"""
-        data = esp_check_data()
-        if not data:
-            return None
-        
-        # Add to buffer
-        self.recv_buffer += data
-        
-        # Look for +IPD pattern: +IPD,<link_id>,<len>:<data>
-        while b"+IPD" in self.recv_buffer:
-            try:
-                idx = self.recv_buffer.find(b"+IPD")
-                # Find the colon
-                colon_idx = self.recv_buffer.find(b":", idx)
-                if colon_idx < 0:
-                    break
-                
-                # Parse header: +IPD,<link>,<len>
-                header = self.recv_buffer[idx:colon_idx].decode()
-                parts = header.replace("+IPD,", "").split(",")
-                if len(parts) >= 2:
-                    link_id = int(parts[0])
-                    data_len = int(parts[1])
-                    
-                    # Check if we have enough data
-                    data_start = colon_idx + 1
-                    data_end = data_start + data_len
-                    
-                    if len(self.recv_buffer) >= data_end:
-                        payload = self.recv_buffer[data_start:data_end]
-                        # Remove processed data from buffer
-                        self.recv_buffer = self.recv_buffer[data_end:]
-                        
-                        # If this is from transcript link, parse it
-                        if link_id == self.transcript_link:
-                            return self._parse_transcript(payload)
-                    else:
-                        # Not enough data yet
-                        break
+        """
+        Parse +IPD frames from recv_buffer. Returns transcript string or None.
+        drain_uart_to_buffer() should be called before this.
+        """
+        found_transcript = None
+
+        while True:
+            # 1. Extract next +IPD packet
+            idx = self.recv_buffer.find(b"+IPD")
+            if idx < 0:
+                if self.recv_buffer:
+                    now = utime.ticks_ms()
+                    if self._buf_stale_ms is None:
+                        self._buf_stale_ms = now
+                    elif utime.ticks_diff(now, self._buf_stale_ms) > 2000:
+                        self.recv_buffer   = b""
+                        self._buf_stale_ms = None
                 else:
-                    # Malformed, skip this +IPD
-                    self.recv_buffer = self.recv_buffer[idx+4:]
-            except Exception as e:
-                print(f"Parse error: {e}")
-                # Clear buffer on error
-                self.recv_buffer = b""
+                    self._buf_stale_ms = None
                 break
-        
-        return None
-    
+
+            self._buf_stale_ms = None
+
+            if idx > 0:
+                self.recv_buffer = self.recv_buffer[idx:]
+
+            colon = self.recv_buffer.find(b":")
+            if colon < 0:
+                break
+
+            try:
+                hdr   = self.recv_buffer[:colon].decode('utf-8', 'ignore')
+                parts = hdr.replace("+IPD,", "").split(",")
+                if len(parts) < 2:
+                    self.recv_buffer = self.recv_buffer[4:]
+                    continue
+
+                link_id  = int(parts[0])
+                data_len = int(parts[1])
+                d_start  = colon + 1
+                d_end    = d_start + data_len
+
+                if len(self.recv_buffer) < d_end:
+                    break   # payload not yet fully arrived
+
+                payload          = self.recv_buffer[d_start:d_end]
+                self.recv_buffer = self.recv_buffer[d_end:]
+
+                # 2. Process payload
+                if link_id == self.transcript_link:
+                    # Append strictly to transcript buffer
+                    # print(f"DEBUG: Found transcript payload: {len(payload)} bytes")
+                    # print(f"DEBUG PAYLOAD: {payload!r}")
+                    # print(f"DEBUG HEX: {[hex(x) for x in payload]}")
+                    self.transcript_buffer += payload
+            except Exception as e:
+                print(f"IPD parse error: {e}")
+                self.recv_buffer = self.recv_buffer[4:]
+
+        # 3. Parse complete messages from transcript_buffer (NEWLINE PROTOCOL)
+        latest_text = None
+        while True:
+            idx = self.transcript_buffer.find(b'\n')
+            if idx < 0:
+                break
+            
+            line = self.transcript_buffer[:idx]
+            self.transcript_buffer = self.transcript_buffer[idx+1:]
+            
+            try:
+                decoded = line.decode('utf-8', 'ignore').strip()
+                if not decoded or decoded == "KEEPALIVE":
+                    continue
+                latest_text = decoded
+            except:
+                pass
+                
+        return latest_text
+
     def _parse_transcript(self, data):
-        """Parse transcript packet"""
         if len(data) < 4:
             return None
-        
         length = struct.unpack('<I', data[:4])[0]
-        
-        # Keepalive packet
         if length == 0:
-            return None
-        
-        # Extract transcript text
+            return None   # keepalive
         if len(data) >= 4 + length:
-            text = data[4:4+length].decode('utf-8', 'ignore')
-            return text
-        
+            return data[4:4 + length].decode('utf-8', 'ignore')
         return None
 
-# -------------------------------
-# MAIN PROGRAM
-# -------------------------------
+
+# ---------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------
 def main():
-    global is_recording
-    
+    is_recording = False
+
     display_status("Starting...")
     time.sleep(1)
-    
-    # Initialize ESP8285 and WiFi
+
     if not esp_init():
+        display_status("Init failed!", "Check ESP8285")
         while True:
             blink_led(5, 0.1)
             time.sleep(2)
-    
-    # Connect to server
+
     client = SpeechClient()
     while not client.connect():
-        time.sleep(2)
-    
-    # Main loop
-    audio_buffer = bytearray(BUFFER_LENGTH * 2)
-    last_transcript = ""
-    
+        display_status("Retrying...", "server conn")
+        time.sleep(3)
+
+    # Small I2S read buffer — READ_SAMPLES at a time so we never block long
+    read_buf     = bytearray(READ_SAMPLES * 2)
+    # Staging buffer — accumulate until SEND_SAMPLES worth collected
+    stage_buf    = bytearray(SEND_SAMPLES * 2)
+    stage_pos    = 0
+
+    current_transcript = ""
+    last_displayed_msg = ""
+    button_held     = False
+    last_press_time = 0
+    audio_packets   = 0
+    # last_display_time removed (no throttling needed)
+
     print("Ready! Press button to start/stop recording.")
-    
-    # Button state
-    button_was_pressed = False 
-    last_press_time = 0 
-    DEBOUNCE_MS = 50 
 
     while True:
         try:
-            # Check button (Active LOW)
+            # ---- Drain UART first — always, every iteration ----
+            # This is the critical change: we drain UART at the TOP of every
+            # loop, before and after any I2S read, so +IPD bytes accumulate
+            # in recv_buffer rather than overflowing the ESP FIFO.
+            client.drain_uart_to_buffer()
+
+            # ---- Button (active LOW, debounced) ----
             if button.value() == 0:
-                current_time = utime.ticks_ms()
-                if not button_was_pressed and utime.ticks_diff(current_time, last_press_time) > DEBOUNCE_MS:
-                    last_press_time = current_time
-                    button_was_pressed = True
-                    
+                now = utime.ticks_ms()
+                if not button_held and utime.ticks_diff(now, last_press_time) > DEBOUNCE_MS:
+                    last_press_time = now
+                    button_held     = True
                     if is_recording:
-                        # Stop recording
                         is_recording = False
                         led.off()
+                        stage_pos    = 0   # discard partial staging buffer
+                        print(f">>> STOP (sent {audio_packets} packets)")
                         client.send_stop()
                         display_status("Stopped", "Press button", "to record")
-                        print("Recording stopped")
+                        audio_packets = 0
                     else:
-                        # Start recording
-                        is_recording = True
+                        is_recording    = True
+                        current_transcript = ""
+                        last_displayed_msg = ""
+                        audio_packets   = 0
+                        stage_pos       = 0
                         led.on()
-                        last_transcript = ""
                         display_status("Recording...", "Speak now")
-                        print("Recording started")
+                        print(">>> RECORDING STARTED")
             else:
-                # Button released
-                button_was_pressed = False
+                button_held = False
 
-            
-            # If recording, capture and send audio
+            # ---- Non-blocking I2S read ----
+            # readinto() with a small buffer returns quickly (< 8ms).
+            # We accumulate samples into stage_buf; when full, send to server.
             if is_recording:
-                n = audio_in.readinto(audio_buffer)
+                n = audio_in.readinto(read_buf)
                 if n > 0:
-                    if not client.send_audio(audio_buffer[:n]):
-                        print("Send failed, reconnecting...")
-                        is_recording = False
-                        led.off()
-                        client.disconnect()
-                        while not client.connect():
-                            time.sleep(2)
-            
-            # Check for transcripts
+                    # Drain UART again immediately after I2S read
+                    client.drain_uart_to_buffer()
+
+                    # Accumulate into staging buffer
+                    space = len(stage_buf) - stage_pos
+                    copy  = min(n, space)
+                    stage_buf[stage_pos:stage_pos + copy] = read_buf[:copy]
+                    stage_pos += copy
+
+                    # When staging buffer is full, send it
+                    if stage_pos >= len(stage_buf):
+                        audio_packets += 1
+                        if audio_packets <= 3 or audio_packets % 20 == 0:
+                            print(f">>> AUDIO packet #{audio_packets}: {stage_pos}B PCM")
+
+                        # Drain UART one more time before the blocking CIPSEND
+                        client.drain_uart_to_buffer()
+
+                        if not client.send_audio(stage_buf):
+                            print(f">>> SEND FAILED at packet #{audio_packets}, reconnecting...")
+                            is_recording  = False
+                            audio_packets = 0
+                            stage_pos     = 0
+                            led.off()
+                            display_status("Send failed!", "Reconnecting")
+                            client.disconnect()
+                            while not client.connect():
+                                time.sleep(3)
+
+                        stage_pos = 0
+
+            # ---- Transcript check ----
+            client.drain_uart_to_buffer()
             transcript = client.check_transcript()
-            if transcript and transcript != last_transcript:
-                display_transcript(transcript)
-                last_transcript = transcript
-            
-            time.sleep_ms(10)
-            
+            if transcript:
+                current_transcript = transcript
+                
+            if current_transcript != last_displayed_msg:
+                # Update shared variable for Core 1 to handle
+                display_transcript(current_transcript)
+                last_displayed_msg = current_transcript
+
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Loop error: {e}")
             time.sleep(1)
-    
-    # Cleanup
+
     client.disconnect()
     audio_in.deinit()
     led.off()
     display_status("Stopped")
 
+
 if __name__ == "__main__":
+    # Start the OLED thread on Core 1 BEFORE main init
+    _thread.start_new_thread(oled_thread_entry, ())
     main()
