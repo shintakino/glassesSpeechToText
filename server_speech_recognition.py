@@ -193,13 +193,11 @@ class PicoHandler:
         self.transcript_sock = transcript_sock
         
     def send_transcript(self, text):
-        """Send transcript to Pico"""
+        """Send transcript to Pico (newline-delimited protocol)"""
         if self.transcript_sock:
             try:
                 data = text.encode('utf-8')
-                length = len(data)
-                self.transcript_sock.send(struct.pack('<I', length))
-                self.transcript_sock.send(data)
+                self.transcript_sock.sendall(data + b'\n')
                 print(f"Sent to Pico: {text}")
             except Exception as e:
                 print(f"Error sending transcript: {e}")
@@ -357,8 +355,7 @@ def transcript_server():
                         try:
                             time.sleep(5) # Send keepalive more frequently
                             if pico_handler.transcript_sock:
-                                # Send 0 length packet as keepalive
-                                pico_handler.transcript_sock.send(struct.pack('<I', 0))
+                                pico_handler.transcript_sock.sendall(b'KEEPALIVE\n')
                         except Exception as e:
                             print(f"Keepalive error: {e}")
                             break

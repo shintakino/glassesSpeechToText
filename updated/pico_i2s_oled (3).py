@@ -23,7 +23,6 @@ from machine import UART, Pin, I2S
 import utime
 import time
 import struct
-import _thread  # KEY: Multi-core support
 
 try:
     from machine import SoftI2C
@@ -79,109 +78,54 @@ button   = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)
 esp_uart = UART(UART_ID, UART_BAUD)
 
 # ---------------------------------------------------------------
-# OLED (CORE 1)
+# OLED
 # ---------------------------------------------------------------
-# Shared state between Core 0 (Main) and Core 1 (Display)
-shared_oled_status = None   # (line1, line2, line3)
-shared_oled_text   = None   # "Transcription..."
-oled_lock          = _thread.allocate_lock()
-
-def oled_thread_entry():
-    """
-    Runs on Core 1. Handles all OLED drawing independently.
-    Checks shared variables and updates screen if changed.
-    """
-    global shared_oled_status, shared_oled_text
-    print("Core 1: OLED Thread Started")
-    oled = None
-    
-    if _HAS_SOFTI2C and ssd1306:
-        try:
-            # Initialize I2C and OLED on Core 1 to avoid conflicts
-            i2c = SoftI2C(scl=Pin(SCL_PIN), sda=Pin(SDA_PIN), freq=400000) # Faster I2C
-            oled = ssd1306.SSD1306_I2C(128, 64, i2c)
-            oled.fill(0)
-            oled.text("OLED Ready", 0, 0)
-            oled.show()
-        except Exception as e:
-            print(f"Core 1 Error: {e}")
-            return
-
-    last_status = None
-    last_text   = None
-
-    while True:
-        # 1. Check for STATUS update (Highest priority overlay)
-        current_status = shared_oled_status
-        if current_status != last_status:
-            if oled:
-                oled.fill(0)
-                l1, l2, l3 = current_status
-                oled.text(l1[:16], 0, 0)
-                if l2: oled.text(l2[:16], 0, 16)
-                if l3: oled.text(l3[:16], 0, 32)
-                oled.show()
-            last_status = current_status
-            last_text   = "" # Invalidate text so it redraws if status clears? 
-                             # Actually usually status IS the screen. 
-                             # If we switch back to text, status becomes None?
-        
-        # 2. Check for TRANSCRIPT update (Only if no active status like 'Recording')
-        #    Actually, we want to show transcript WHILE recording.
-        #    So 'Recording...' status is just a transient state?
-        #    No, display_status is used for 'Recording...'.
-        #    We need a mechanism to know if we are in 'Text Mode'.
-        
-        # IMPROVED LOGIC:
-        # If shared_oled_text is updated, we show it.
-        # If shared_oled_status is updated, we show it.
-        # Whichever changed LAST is what we show?
-        
-        # Simple approach:
-        # Main loop clears status when showing text?
-        # display_transcript() -> sets status=None, text="..."
-        
-        current_text = shared_oled_text
-        if current_text and current_text != last_text:
-            # New text available
-            if oled:
-                oled.fill(0)
-                # Word wrap logic
-                words, lines, cur = current_text.split(), [], ""
-                for w in words:
-                    test = (cur + " " + w) if cur else w
-                    if len(test) <= 16:
-                        cur = test
-                    else:
-                        lines.append(cur)
-                        cur = w
-                if cur: lines.append(cur)
-                
-                for i, ln in enumerate(lines[:8]):
-                    oled.text(ln, 0, i * 8)
-                oled.show()
-            
-            last_text = current_text
-            # We don't clear status, we just overwrote the screen.
-            # But if status changes again, it will overwrite this.
-            # Perfect.
-        
-        time.sleep_ms(50) # check 20 times per second
+oled = None
+if _HAS_SOFTI2C and ssd1306:
+    try:
+        i2c = SoftI2C(scl=Pin(SCL_PIN), sda=Pin(SDA_PIN), freq=400000)
+        oled = ssd1306.SSD1306_I2C(128, 64, i2c)
+        oled.fill(0)
+        oled.text("OLED Ready", 0, 0)
+        oled.show()
+    except Exception as e:
+        print(f"OLED Init Error: {e}")
 
 
 def display_status(line1, line2="", line3=""):
     print(f"Display: {line1} | {line2} | {line3}")
-    global shared_oled_status, shared_oled_text
-    shared_oled_text = None  # Clear text so next text update triggers
-    shared_oled_status = (line1, line2, line3)
+    if not oled:
+        return
+    oled.fill(0)
+    oled.text(line1[:16], 0,  0)
+    if line2: oled.text(line2[:16], 0, 16)
+    if line3: oled.text(line3[:16], 0, 32)
+    oled.show()
 
 
 def display_transcript(text):
     print(f"TRANSCRIPT: {text}")
-    global shared_oled_text
-    # We leave status as is? No, we want to show text.
-    # We implicitly override status.
-    shared_oled_text = text
+    if not oled:
+        return
+    oled.fill(0)
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        test = (cur + " " + w) if cur else w
+        if len(test) <= 16:
+            cur = test
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    
+    print(f"DEBUG OLED LINES: {lines}")
+
+    # Show LAST 8 lines (auto-scroll to bottom)
+    visible = lines[-8:] if len(lines) > 8 else lines
+    for i, ln in enumerate(visible):
+        oled.text(ln, 0, i * 8)
+    oled.show()
 
 
 # ---------------------------------------------------------------
@@ -358,7 +302,7 @@ def esp_send_data(link_id, data, timeout=8000):
 def esp_init():
     display_status("Init ESP8285...")
     esp_uart.write('+++')
-    time.sleep(1)
+    time.sleep_ms(1000)
     _uart_discard_all()
 
     ok, _ = esp_send_cmd("AT", "OK", 2000)
@@ -599,7 +543,7 @@ def main():
     is_recording = False
 
     display_status("Starting...")
-    time.sleep(1)
+    time.sleep_ms(1000)
 
     if not esp_init():
         display_status("Init failed!", "Check ESP8285")
@@ -610,7 +554,7 @@ def main():
     client = SpeechClient()
     while not client.connect():
         display_status("Retrying...", "server conn")
-        time.sleep(3)
+        time.sleep_ms(3000)
 
     # Small I2S read buffer — READ_SAMPLES at a time so we never block long
     read_buf     = bytearray(READ_SAMPLES * 2)
@@ -620,10 +564,12 @@ def main():
 
     current_transcript = ""
     last_displayed_msg = ""
+    accumulated_text   = ""   # All finalized sentences
+    current_interim    = ""   # Current interim result
     button_held     = False
     last_press_time = 0
     audio_packets   = 0
-    # last_display_time removed (no throttling needed)
+    last_display_time = 0
 
     print("Ready! Press button to start/stop recording.")
 
@@ -651,6 +597,8 @@ def main():
                         audio_packets = 0
                     else:
                         is_recording    = True
+                        accumulated_text = ""   # Reset accumulated sentences
+                        current_interim  = ""   # Reset interim
                         current_transcript = ""
                         last_displayed_msg = ""
                         audio_packets   = 0
@@ -702,18 +650,30 @@ def main():
             client.drain_uart_to_buffer()
             transcript = client.check_transcript()
             if transcript:
-                current_transcript = transcript
+                # Interim results end with "...", final results don't
+                if transcript.endswith("..."):
+                    current_interim = transcript
+                else:
+                    # Final result — accumulate it
+                    accumulated_text += transcript + " "
+                    current_interim = ""
                 
-            if current_transcript != last_displayed_msg:
-                # Update shared variable for Core 1 to handle
-                display_transcript(current_transcript)
-                last_displayed_msg = current_transcript
+                # Build display: all finalized + current interim
+                display_text = accumulated_text + current_interim
+                display_text = display_text.strip()
+                
+                if display_text and display_text != last_displayed_msg:
+                    now = utime.ticks_ms()
+                    if utime.ticks_diff(now, last_display_time) > 200:
+                        display_transcript(display_text)
+                        last_displayed_msg = display_text
+                        last_display_time  = now
 
         except KeyboardInterrupt:
             break
         except Exception as e:
             print(f"Loop error: {e}")
-            time.sleep(1)
+            time.sleep_ms(1000)
 
     client.disconnect()
     audio_in.deinit()
@@ -722,6 +682,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Start the OLED thread on Core 1 BEFORE main init
-    _thread.start_new_thread(oled_thread_entry, ())
     main()
