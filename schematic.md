@@ -8,6 +8,7 @@ This document outlines the hardware connections for the Glasses Speech-to-Text s
 - **WiFi**: ESP8285 (via UART)
 - **Audio Input**: INMP441 MEMS Microphone (I2S)
 - **Display**: SSD1306 OLED 0.96" (I2C)
+- **Storage**: MicroSD Card Module (SPI)
 - **Input**: Push Button (GPIO)
 - **Status**: Built-in LED (GPIO 25 or 'LED')
 
@@ -20,6 +21,7 @@ This document outlines the hardware connections for the Glasses Speech-to-Text s
 | **SSD1306** | 0.96" OLED Display (I2C) | 1 | 128x64 pixels |
 | **Battery** | 3.7V LiPo Battery (e.g., 600mAh+) | 1 | Connector: JST-PH 2.0 usually |
 | **Charger** | TP4056 USB Charger Module | 1 | With protection circuit preferred |
+| **MicroSD** | MicroSD Card Breakout Module (SPI) | 1 | 3.3V compatible, with level shifter |
 | **Switch** | SPDT Slide Switch | 1 | For power On/Off |
 | **Button** | Momentary Push Button | 1 | 6x6mm tactile switch |
 | **Resistors** | 4.7kΩ (Optional) | 2 | For I2C Pull-ups (if OLED lacks them) |
@@ -44,6 +46,12 @@ This document outlines the hardware connections for the Glasses Speech-to-Text s
 | | SDA | GPIO 4 | I2C Data (SoftI2C) |
 | | VCC | 3.3V (OUT) | Power |
 | | GND | GND | Ground |
+| **MicroSD** | GND | GND | Ground (Pin 1) |
+| | VCC | 3.3V (OUT) | Power (Pin 2) |
+| | MISO | GPIO 12 | SPI1 RX / Data Out (Pin 4) |
+| | MOSI | GPIO 11 | SPI1 TX / Data In (Pin 5) |
+| | SCK | GPIO 10 | SPI1 Clock (Pin 6) |
+| | CS | GPIO 13 | SPI1 Chip Select (Pin 7) |
 | **Button** | Signal | GPIO 14 | Active LOW (Pull-up) |
 | | GND | GND | Ground |
 | **LED** | - | Built-in | Status Indicator |
@@ -76,6 +84,11 @@ graph TD
         Pico_I2S_SD[GPIO 18 - SD]
         
         Pico_BTN[GPIO 14]
+
+        Pico_SPI_SCK[GPIO 10 - SCK]
+        Pico_SPI_MOSI[GPIO 11 - MOSI]
+        Pico_SPI_MISO[GPIO 12 - MISO]
+        Pico_SPI_CS[GPIO 13 - CS]
     end
 
     subgraph PowerSource [Power System]
@@ -119,6 +132,15 @@ graph TD
         subgraph UserInterface [User Interface]
             Button[Push Button]
         end
+
+        subgraph Storage [MicroSD Card Module]
+            SD_SCK[SCK]
+            SD_MOSI[MOSI / DI]
+            SD_MISO[MISO / DO]
+            SD_CS[CS]
+            SD_VCC[VCC]
+            SD_GND[GND]
+        end
     end
 
     %% External Connections
@@ -137,6 +159,13 @@ graph TD
 
     Pico_BTN --> Button
     Button --> GND
+
+    Pico3V3 --> SD_VCC
+    GND --> SD_GND
+    Pico_SPI_SCK --> SD_SCK
+    Pico_SPI_MOSI --> SD_MOSI
+    SD_MISO --> Pico_SPI_MISO
+    Pico_SPI_CS --> SD_CS
 ```
 
 ## Wiring Notes
@@ -144,3 +173,4 @@ graph TD
 1.  **I2C Pull-ups**: The SSD1306 OLED usually has built-in pull-up resistors. If not, add 4.7kΩ resistors from SDA and SCL to 3.3V.
 2.  **Microphone Channel**: Connecting L/R to GND selects the Left channel. Connecting to VCC selects Right. Our code uses Mono (Left).
 3.  **Power Supply**: Ensure your 3.3V source can supply enough current (~300mA peak) for the ESP8285 WiFi transmission. The Pico's onboard regulator is usually sufficient.
+4.  **MicroSD Module**: Use a 3.3V-compatible module (most breakout boards include a level shifter). SPI1 is used on GPIO 10-13 to avoid conflicts with I2S (GPIO 16-18) and I2C (GPIO 4-5). Format the SD card as FAT32.

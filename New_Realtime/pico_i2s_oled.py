@@ -49,10 +49,13 @@ BUTTON_PIN = 14
 SAMPLE_RATE     = 16000
 BITS_PER_SAMPLE = 16
 
-# I2S read chunk: ~50ms of audio = 800 samples * 2 bytes = 1600 bytes
-CHUNK_BYTES = 1600
-ESP_MAX_SEND = 2048
-DEBOUNCE_MS  = 200
+# Small I2S reads to keep DMA drained (~8ms each = 128 samples)
+READ_SAMPLES    = 128
+READ_BYTES      = READ_SAMPLES * 2   # 256 bytes per read
+# Accumulate to SEND_BYTES before sending over TCP (~100ms = 3200 bytes)
+SEND_BYTES      = 3200
+ESP_MAX_SEND    = 2048
+DEBOUNCE_MS     = 200
 
 # Protocol constants
 MSG_AUDIO = 0x01
@@ -130,7 +133,7 @@ audio_in = I2S(
     bits=BITS_PER_SAMPLE,
     format=I2S.MONO,
     rate=SAMPLE_RATE,
-    ibuf=CHUNK_BYTES * 4,
+    ibuf=SEND_BYTES * 8,   # Large DMA buffer (800ms) to survive UART delays
 )
 
 # ---------------------------------------------------------------
@@ -171,11 +174,17 @@ def _wait_for_ack(ack, timeout):
     return False, response
 
 
-def _wait_for_prompt(timeout=3000):
-    """Wait for '>' after AT+CIPSEND."""
+def _wait_for_prompt(i2s_buf=None, stage_buf=None, stage_pos_ref=None, timeout=3000):
+    """Wait for '>' after AT+CIPSEND. Optionally drain I2S while waiting."""
     accumulated = b""
     start = utime.ticks_ms()
     while utime.ticks_diff(utime.ticks_ms(), start) < timeout:
+        # Drain I2S to prevent DMA overflow
+        if i2s_buf is not None and stage_buf is not None and stage_pos_ref is not None:
+            n = audio_in.readinto(i2s_buf)
+            if n > 0 and stage_pos_ref[0] + n <= len(stage_buf):
+                stage_buf[stage_pos_ref[0]:stage_pos_ref[0]+n] = i2s_buf[:n]
+                stage_pos_ref[0] += n
         if esp_uart.any():
             chunk = esp_uart.read()
             if chunk:
@@ -184,27 +193,32 @@ def _wait_for_prompt(timeout=3000):
                     return True
                 if b"ERROR" in accumulated or b"link is not valid" in accumulated:
                     return False
-        time.sleep_ms(5)
+        time.sleep_ms(2)
     return False
 
 
-def _wait_send_ok(timeout=8000):
-    """Wait for SEND OK. Returns (success, leftover_bytes_with_possible_IPD)."""
+def _wait_send_ok(i2s_buf=None, stage_buf=None, stage_pos_ref=None, timeout=8000):
+    """Wait for SEND OK. Returns (success, leftover_bytes). Drains I2S while waiting."""
     accumulated = b""
     start = utime.ticks_ms()
     while utime.ticks_diff(utime.ticks_ms(), start) < timeout:
+        # Drain I2S to prevent DMA overflow
+        if i2s_buf is not None and stage_buf is not None and stage_pos_ref is not None:
+            n = audio_in.readinto(i2s_buf)
+            if n > 0 and stage_pos_ref[0] + n <= len(stage_buf):
+                stage_buf[stage_pos_ref[0]:stage_pos_ref[0]+n] = i2s_buf[:n]
+                stage_pos_ref[0] += n
         if esp_uart.any():
             chunk = esp_uart.read()
             if chunk:
                 accumulated += chunk
                 if b"SEND OK" in accumulated:
-                    # Return leftover after SEND OK (might contain +IPD data)
                     idx = accumulated.find(b"SEND OK")
                     leftover = accumulated[idx + 7:]
                     return True, leftover
                 if b"SEND FAIL" in accumulated or b"link is not valid" in accumulated:
                     return False, b""
-        time.sleep_ms(5)
+        time.sleep_ms(2)
     return False, b""
 
 
@@ -214,32 +228,38 @@ def esp_send_cmd(cmd, ack="OK", timeout=5000):
     return _wait_for_ack(ack, timeout)
 
 
-def esp_send_data_fast(link_id, data, timeout=8000):
+def esp_send_data_fast(link_id, data, i2s_buf=None, stage_buf=None, stage_pos_ref=None, timeout=8000):
     """
     Send data over TCP. Returns (success, leftover_bytes).
-    Leftover bytes may contain +IPD transcript data that arrived during send.
+    Optionally drains I2S while waiting for UART responses.
     """
     offset = 0
     all_leftover = b""
     while offset < len(data):
         chunk = data[offset: offset + ESP_MAX_SEND]
         esp_uart.write(f'AT+CIPSEND={link_id},{len(chunk)}\r\n')
-        if not _wait_for_prompt(3000):
+        if not _wait_for_prompt(i2s_buf, stage_buf, stage_pos_ref, 3000):
             return False, all_leftover
 
-        # Write in small bursts, polling RX between bursts
+        # Write in small bursts, polling RX and I2S between bursts
         c_idx = 0
         rx_during = b""
         while c_idx < len(chunk):
             esp_uart.write(chunk[c_idx : c_idx + 64])
             c_idx += 64
-            # Quick RX poll to prevent FIFO overflow
+            # Drain I2S
+            if i2s_buf is not None and stage_buf is not None and stage_pos_ref is not None:
+                n = audio_in.readinto(i2s_buf)
+                if n > 0 and stage_pos_ref[0] + n <= len(stage_buf):
+                    stage_buf[stage_pos_ref[0]:stage_pos_ref[0]+n] = i2s_buf[:n]
+                    stage_pos_ref[0] += n
+            # Quick RX poll
             if esp_uart.any():
                 r = esp_uart.read()
                 if r:
                     rx_during += r
 
-        ok, leftover = _wait_send_ok(timeout)
+        ok, leftover = _wait_send_ok(i2s_buf, stage_buf, stage_pos_ref, timeout)
         all_leftover += rx_during + leftover
         if not ok:
             return False, all_leftover
@@ -419,7 +439,9 @@ def main():
             time.sleep(2)
 
     link_id = 0
-    read_buf = bytearray(CHUNK_BYTES)
+    read_buf = bytearray(READ_BYTES)          # Small I2S read buffer
+    stage_buf = bytearray(SEND_BYTES * 4)     # Staging: accumulate audio while sending
+    stage_pos = [0]                            # Mutable ref for passing to send functions
     parser = TranscriptParser(link_id)
 
     display_status("Ready!", "Hold button", "to record")
@@ -436,6 +458,7 @@ def main():
                 # ---- START SESSION ----
                 led.on()
                 parser.reset()
+                stage_pos[0] = 0
                 display_status("Connecting...")
 
                 if not esp_connect_tcp(link_id, SERVER_IP, SERVER_PORT):
@@ -464,19 +487,32 @@ def main():
 
                 audio_packets = 0
                 last_display_time = 0
+                stage_pos[0] = 0
 
                 # ---- STREAMING LOOP (while button held) ----
                 while button.value() == 0:
-                    # 1. Read ~50ms of audio from I2S
+                    # 1. Read small I2S chunk (~8ms) into staging buffer
                     n = audio_in.readinto(read_buf)
 
                     if n > 0:
-                        # 2. Build packet: [0x01][2-byte len][PCM]
-                        header = bytes([MSG_AUDIO]) + struct.pack('<H', n)
-                        packet = header + bytes(read_buf[:n])
+                        # Accumulate into staging buffer
+                        if stage_pos[0] + n <= len(stage_buf):
+                            stage_buf[stage_pos[0]:stage_pos[0]+n] = read_buf[:n]
+                            stage_pos[0] += n
 
-                        # 3. Send audio chunk
-                        ok, leftover = esp_send_data_fast(link_id, packet)
+                    # 2. When enough audio accumulated, send it
+                    if stage_pos[0] >= SEND_BYTES:
+                        send_len = stage_pos[0]
+                        # Build packet: [0x01][2-byte len][PCM]
+                        header = bytes([MSG_AUDIO]) + struct.pack('<H', send_len)
+                        packet = header + bytes(stage_buf[:send_len])
+                        stage_pos[0] = 0  # Reset staging BEFORE send
+
+                        # 3. Send audio chunk — I2S drains into stage_buf during send
+                        ok, leftover = esp_send_data_fast(
+                            link_id, packet,
+                            read_buf, stage_buf, stage_pos
+                        )
                         if leftover:
                             parser.feed(leftover)
                         if not ok:
@@ -485,7 +521,7 @@ def main():
 
                         audio_packets += 1
                         if audio_packets <= 3 or audio_packets % 20 == 0:
-                            print(f">>> Audio chunk #{audio_packets}: {n}B")
+                            print(f">>> Audio chunk #{audio_packets}: {send_len}B")
 
                     # 4. Poll UART for transcript (non-blocking)
                     parser.drain_uart()
@@ -499,6 +535,16 @@ def main():
                 # ---- STOP SESSION ----
                 led.off()
                 print(f">>> STREAMING STOPPED ({audio_packets} chunks)")
+
+                # Send any remaining staged audio
+                if stage_pos[0] > 0:
+                    send_len = stage_pos[0]
+                    header = bytes([MSG_AUDIO]) + struct.pack('<H', send_len)
+                    packet = header + bytes(stage_buf[:send_len])
+                    ok, leftover = esp_send_data_fast(link_id, packet)
+                    if leftover:
+                        parser.feed(leftover)
+                    stage_pos[0] = 0
 
                 # Send STOP marker
                 ok, leftover = esp_send_data_fast(link_id, bytes([MSG_STOP]))

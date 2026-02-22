@@ -113,6 +113,7 @@ SAMPLE_WIDTH = 2
 NUM_CHANNELS = 1
 HOST = "0.0.0.0"
 PORT = 5000
+MAX_RECORDINGS = 5     # Keep only the latest N recordings
 
 # Protocol constants
 MSG_AUDIO = 0x01
@@ -132,6 +133,19 @@ def save_wav(pcm_data, filepath):
         wf.writeframes(pcm_data)
     duration = len(pcm_data) / (SAMPLE_RATE * SAMPLE_WIDTH * NUM_CHANNELS)
     print(f"  Saved WAV: {filepath} ({len(pcm_data)} bytes, {duration:.1f}s)")
+    cleanup_old_recordings()
+
+
+def cleanup_old_recordings():
+    """Delete oldest recordings if we exceed MAX_RECORDINGS."""
+    wav_files = sorted(
+        [f for f in os.listdir(recordings_dir) if f.endswith('.wav')],
+    )
+    while len(wav_files) > MAX_RECORDINGS:
+        oldest = wav_files.pop(0)
+        path = os.path.join(recordings_dir, oldest)
+        os.remove(path)
+        print(f"  Deleted old recording: {oldest}")
 
 
 # ---------------------------------------------------------------
@@ -278,7 +292,11 @@ class StreamingSession:
             print("  Recognition stream ended")
 
         except Exception as e:
-            print(f"  Recognition error: {e}")
+            error_str = str(e)
+            if "400" in error_str or "invalid argument" in error_str.lower():
+                print(f"  Recognition stream limit reached (this is normal for long recordings)")
+            else:
+                print(f"  Recognition error: {e}")
 
 
 # ---------------------------------------------------------------
@@ -288,6 +306,7 @@ def start_server():
     """Start the TCP server."""
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.settimeout(1.0)  # Allow Ctrl+C to interrupt
     server_sock.bind((HOST, PORT))
     server_sock.listen(1)
 
@@ -299,11 +318,18 @@ def start_server():
             conn, addr = server_sock.accept()
             conn.settimeout(60.0)
 
-            # Wait for START handshake
+            # Wait for START handshake (tolerate garbage bytes from ESP8285)
             try:
-                handshake = conn.recv(16)
-                if not handshake or not handshake.strip().startswith(b"START"):
-                    print(f"Invalid handshake from {addr}: {handshake}")
+                handshake = b""
+                for _ in range(3):  # Try up to 3 reads
+                    chunk = conn.recv(64)
+                    if not chunk:
+                        break
+                    handshake += chunk
+                    if b"START" in handshake:
+                        break
+                if b"START" not in handshake:
+                    print(f"Invalid handshake from {addr}: {handshake[:20]}")
                     conn.close()
                     continue
             except Exception as e:
@@ -316,6 +342,8 @@ def start_server():
             t = threading.Thread(target=session.run, daemon=True)
             t.start()
 
+        except socket.timeout:
+            continue  # Loop back to accept, allows Ctrl+C to work
         except Exception as e:
             print(f"Server error: {e}")
             time.sleep(1)
