@@ -99,6 +99,7 @@ esp_uart = UART(UART_ID, UART_BAUD)
 # SD CARD
 # ---------------------------------------------------------------
 sd_mounted = False
+oled = None
 
 def init_sd():
     global sd_mounted
@@ -125,16 +126,26 @@ def init_sd():
 # ---------------------------------------------------------------
 # OLED
 # ---------------------------------------------------------------
-oled = None
-if _HAS_SOFTI2C and ssd1306:
+def init_oled():
+    global oled
+    if not _HAS_SOFTI2C or not ssd1306:
+        print("SoftI2C or ssd1306 missing")
+        return False
     try:
+        # Re-init pins with explicit pull-ups just in case power sag affected them
+        scl_pin = Pin(SCL_PIN, Pin.IN, Pin.PULL_UP)
+        sda_pin = Pin(SDA_PIN, Pin.IN, Pin.PULL_UP)
+        time.sleep_ms(50)
+        
         i2c = SoftI2C(scl=Pin(SCL_PIN), sda=Pin(SDA_PIN), freq=400000)
         oled = ssd1306.SSD1306_I2C(128, 64, i2c)
         oled.fill(0)
         oled.text("OLED Ready", 0, 0)
         oled.show()
+        return True
     except Exception as e:
         print(f"OLED Init Error: {e}")
+        return False
 
 
 def display_status(line1, line2="", line3="", line4=""):
@@ -460,12 +471,21 @@ def send_and_transcribe(pcm_file, pcm_len):
 # MAIN
 # ---------------------------------------------------------------
 def main():
-    display_status("Starting...")
-    time.sleep_ms(1000)
+    print("Starting... waiting for power to stabilize")
+    time.sleep_ms(1500)  # Give 1.5s for 3.3V rail to stabilize after boot
 
-    # Init SD Card
-    display_status("Init SD card...")
-    if not init_sd():
+    # Init SD Card FIRST (high power draw on init)
+    print("Init SD card...")
+    sd_ok = init_sd()
+
+    # Init OLED SECOND
+    print("Init OLED...")
+    init_oled()
+
+    display_status("Starting...")
+    time.sleep_ms(500)
+
+    if not sd_ok:
         display_status("SD Card", "failed!", "Check wiring", "SCK=10 CS=13")
         while True:
             blink_led(5, 0.1)
