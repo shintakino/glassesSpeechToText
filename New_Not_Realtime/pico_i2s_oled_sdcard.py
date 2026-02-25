@@ -108,7 +108,8 @@ def init_sd():
         return False
     try:
         spi = SPI(1, sck=Pin(SD_SCK_PIN), mosi=Pin(SD_MOSI_PIN), miso=Pin(SD_MISO_PIN))
-        sd = sdcard.SDCard(spi, Pin(SD_CS_PIN))
+        cs = Pin(SD_CS_PIN, Pin.OUT)
+        sd = sdcard.SDCard(spi, cs)
         os.mount(sd, "/sd")
         sd_mounted = True
         print("SD card mounted at /sd")

@@ -21,7 +21,7 @@ This document outlines the hardware connections for the Glasses Speech-to-Text s
 | **SSD1306** | 0.96" OLED Display (I2C) | 1 | 128x64 pixels |
 | **Battery** | 3.7V LiPo Battery (e.g., 600mAh+) | 1 | Connector: JST-PH 2.0 usually |
 | **Charger** | TP4056 USB Charger Module | 1 | With protection circuit preferred |
-| **MicroSD** | MicroSD Card Breakout Module (SPI) | 1 | 3.3V compatible, with level shifter |
+| **MicroSD** | MicroSD Card Breakout Module (SPI) | 1 | Standard 5V module with onboard regulator/level shifter |
 | **Switch** | SPDT Slide Switch | 1 | For power On/Off |
 | **Button** | Momentary Push Button | 1 | 6x6mm tactile switch |
 | **Resistors** | 4.7kΩ (Optional) | 2 | For I2C Pull-ups (if OLED lacks them) |
@@ -47,7 +47,7 @@ This document outlines the hardware connections for the Glasses Speech-to-Text s
 | | VCC | 3.3V (OUT) | Power |
 | | GND | GND | Ground |
 | **MicroSD** | GND | GND | Ground (Pin 1) |
-| | VCC | 3.3V (OUT) | Power (Pin 2) |
+| | VCC | VSYS or VBUS (5V) | Power (Pin 2) |
 | | MISO | GPIO 12 | SPI1 RX / Data Out (Pin 4) |
 | | MOSI | GPIO 11 | SPI1 TX / Data In (Pin 5) |
 | | SCK | GPIO 10 | SPI1 Clock (Pin 6) |
@@ -160,7 +160,7 @@ graph TD
     Pico_BTN --> Button
     Button --> GND
 
-    Pico3V3 --> SD_VCC
+    VSYS --> SD_VCC
     GND --> SD_GND
     Pico_SPI_SCK --> SD_SCK
     Pico_SPI_MOSI --> SD_MOSI
@@ -173,4 +173,4 @@ graph TD
 1.  **I2C Pull-ups**: The SSD1306 OLED usually has built-in pull-up resistors. If not, add 4.7kΩ resistors from SDA and SCL to 3.3V.
 2.  **Microphone Channel**: Connecting L/R to GND selects the Left channel. Connecting to VCC selects Right. Our code uses Mono (Left).
 3.  **Power Supply**: Ensure your 3.3V source can supply enough current (~300mA peak) for the ESP8285 WiFi transmission. The Pico's onboard regulator is usually sufficient.
-4.  **MicroSD Module**: Use a 3.3V-compatible module (most breakout boards include a level shifter). SPI1 is used on GPIO 10-13 to avoid conflicts with I2S (GPIO 16-18) and I2C (GPIO 4-5). Format the SD card as FAT32.
+4.  **MicroSD Module Power**: Standard MicroSD modules with onboard level shifters have a built-in 3.3V regulator that requires a **5V input**. Connect its VCC to the **VSYS** or **VBUS** pin on the Pico. Do not connect it to the 3.3V OUT pin, as the onboard regulator will drop the voltage too low for the SD card to function.
