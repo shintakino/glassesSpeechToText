@@ -165,7 +165,7 @@ def display_transcript(text):
     print(f"TRANSCRIPT: {text}")
     if not oled:
         return
-    oled.fill(0)
+        
     words, lines, cur = text.split(), [], ""
     for w in words:
         test = (cur + " " + w) if cur else w
@@ -177,10 +177,27 @@ def display_transcript(text):
     if cur:
         lines.append(cur)
 
-    visible = lines[-8:] if len(lines) > 8 else lines
-    for i, ln in enumerate(visible):
-        oled.text(ln, 0, i * 8)
-    oled.show()
+    if len(lines) <= 8:
+        # Fits on one screen, just show it
+        oled.fill(0)
+        for i, ln in enumerate(lines):
+            oled.text(ln, 0, i * 8)
+        oled.show()
+    else:
+        # Animation: Show first page, then scroll down line by line
+        oled.fill(0)
+        for i, ln in enumerate(lines[:8]):
+            oled.text(ln, 0, i * 8)
+        oled.show()
+        time.sleep(3) # Pause so you can read the start
+        
+        for start_idx in range(1, len(lines) - 7):
+            oled.fill(0)
+            visible = lines[start_idx : start_idx + 8]
+            for i, ln in enumerate(visible):
+                oled.text(ln, 0, i * 8)
+            oled.show()
+            time.sleep(1.2) # Delays for comfortable reading of the new line
 
 
 # ---------------------------------------------------------------
@@ -505,10 +522,11 @@ def main():
 
     while True:
         try:
+            # Wait until button is firmly pressed
             if button.value() == 0:
                 time.sleep_ms(DEBOUNCE_MS)
                 if button.value() != 0:
-                    continue
+                    continue  # False alarm / bounce
 
                 # ---- RECORDING TO SD CARD ----
                 led.on()
