@@ -44,22 +44,15 @@ SDA_PIN_OLED = 4
 TEST_FILE = "/sd/pico_test.txt"
 
 def run_test():
+    print("Starting... waiting for power to stabilize")
+    time.sleep_ms(1500)
+
     print("=" * 40)
     print("SD Card Hardware Test")
     print("=" * 40)
     
+    # We define this first so it safely ignores updates before OLED is initialized
     oled = None
-    if HAS_OLED:
-        try:
-            i2c = SoftI2C(scl=Pin(SCL_PIN_OLED), sda=Pin(SDA_PIN_OLED), freq=200000)
-            if i2c.scan():
-                oled = ssd1306.SSD1306_I2C(128, 64, i2c)
-                oled.fill(0)
-                oled.text("SD Card Test", 0, 0)
-                oled.show()
-        except Exception as e:
-            print(f"OLED Init Error: {e}")
-
     def update_oled(step, status):
         if oled:
             oled.fill_rect(0, 20, 128, 44, 0) # clear bottom area
@@ -67,15 +60,13 @@ def run_test():
             oled.text(status, 0, 40)
             oled.show()
 
-    # 1. Check for the sdcard library
+    # 1. Check for the sdcard library (SD Card First!)
     try:
         import sdcard
         print("[OK] sdcard module found.")
-        update_oled("1. sdcard.py", "OK")
     except ImportError:
         print("[FAIL] sdcard module missing!")
         print("Please copy `sdcard.py` to the root of your Pico.")
-        update_oled("1. sdcard.py", "FAIL: Missing")
         return
 
     # 2. Initialize SPI
@@ -86,10 +77,8 @@ def run_test():
         spi = SPI(1, sck=Pin(SCK_PIN), mosi=Pin(MOSI_PIN), miso=Pin(MISO_PIN))
         cs = Pin(CS_PIN, Pin.OUT)
         print("[OK] SPI initialized (Pins: SCK=10, MOSI=11, MISO=12, CS=13).")
-        update_oled("2. SPI init", "OK")
     except Exception as e:
         print(f"[FAIL] SPI initialization failed: {e}")
-        update_oled("2. SPI init", "FAIL")
         return
 
     # 3. Mount the SD Card
@@ -99,22 +88,38 @@ def run_test():
         vfs = os.VfsFat(sd)
         os.mount(vfs, "/sd")
         print("[OK] SD Card mounted at /sd.")
-        update_oled("3. Mount", "OK")
     except OSError as e:
         # If the SD card is already mounted, unmount and remount or ignore
         if e.args[0] == 16:  # EBUSY typically means already mounted
             print("[INFO] SD Card already mounted.")
-            update_oled("3. Mount", "OK (already)")
         else:
             print(f"[FAIL] Could not mount SD card: {e}")
             print("Check wiring and ensure the card is formatted as FAT32.")
-            update_oled("3. Mount", "FAIL: OSError")
             return
     except Exception as e:
         print(f"[FAIL] Error communicating with SD card: {e}")
         print("Check your wiring to SCK, MOSI, MISO, and CS.")
-        update_oled("3. Mount", "FAIL: Comm")
         return
+        
+    # --- NOW INITIALIZE OLED ---
+    if HAS_OLED:
+        print("\nInitializing OLED...")
+        try:
+            # Explicit pull-ups just in case power sag affected them during SD init
+            Pin(SCL_PIN_OLED, Pin.IN, Pin.PULL_UP)
+            Pin(SDA_PIN_OLED, Pin.IN, Pin.PULL_UP)
+            time.sleep_ms(50)
+            
+            i2c = SoftI2C(scl=Pin(SCL_PIN_OLED), sda=Pin(SDA_PIN_OLED), freq=400000)
+            if i2c.scan():
+                oled = ssd1306.SSD1306_I2C(128, 64, i2c)
+                oled.fill(0)
+                oled.text("SD Card Test", 0, 0)
+                oled.text("Init & Mount OK", 0, 20)
+                oled.show()
+                time.sleep_ms(1000)
+        except Exception as e:
+            print(f"OLED Init Error: {e}")
 
     # 4. Show free space
     try:
