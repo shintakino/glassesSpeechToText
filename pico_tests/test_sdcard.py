@@ -25,6 +25,11 @@ import os
 import time
 
 try:
+    import sdcard
+except ImportError:
+    sdcard = None
+
+try:
     import ssd1306
     HAS_OLED = True
 except ImportError:
@@ -61,13 +66,12 @@ def run_test():
             oled.show()
 
     # 1. Check for the sdcard library (SD Card First!)
-    try:
-        import sdcard
-        print("[OK] sdcard module found.")
-    except ImportError:
+    if sdcard is None:
         print("[FAIL] sdcard module missing!")
         print("Please copy `sdcard.py` to the root of your Pico.")
         return
+    else:
+        print("[OK] sdcard module found.")
 
     # 2. Initialize SPI
     print("\nInitializing SPI...")
