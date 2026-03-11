@@ -23,6 +23,14 @@ You can find it here: https://github.com/micropython/micropython-lib/blob/master
 from machine import Pin, SPI, SoftI2C
 import os
 import time
+import sys
+
+# Ensure the root directory is in the path so we can find sdcard.py
+if '' not in sys.path:
+    sys.path.append('')
+# Also add '/' just in case
+if '/' not in sys.path:
+    sys.path.append('/')
 
 try:
     import sdcard

@@ -161,43 +161,111 @@ def display_status(line1, line2="", line3="", line4=""):
     oled.show()
 
 
-def display_transcript(text):
-    print(f"TRANSCRIPT: {text}")
-    if not oled:
-        return
-        
-    words, lines, cur = text.split(), [], ""
+def _wrap_text(text, max_chars=16):
+    """Word-wrap text into lines of max_chars width."""
+    words = text.split()
+    lines = []
+    cur = ""
     for w in words:
+        # If a single word is too long, force-split it
+        if len(w) > max_chars:
+            if cur:
+                lines.append(cur)
+                cur = ""
+            while len(w) > max_chars:
+                lines.append(w[:max_chars])
+                w = w[max_chars:]
+            if w:
+                cur = w
+            continue
         test = (cur + " " + w) if cur else w
-        if len(test) <= 16:
+        if len(test) <= max_chars:
             cur = test
         else:
             lines.append(cur)
             cur = w
     if cur:
         lines.append(cur)
+    return lines
 
-    if len(lines) <= 8:
-        # Fits on one screen, just show it
+
+def display_transcript(text):
+    print(f"TRANSCRIPT: {text}")
+    if not oled:
+        return
+
+    lines = _wrap_text(text, 16)
+    total_lines = len(lines)
+
+    # Header area: 10px (text at y=1, line at y=9)
+    HEADER_H = 10
+    # Content area: 64 - 10 = 54px, fits 6 lines of 8px text
+    CONTENT_H = 54
+    VISIBLE_LINES = CONTENT_H // 8  # 6 lines visible at a time
+
+    def _draw_frame(scroll_line_offset):
+        """Draw one frame. scroll_line_offset is the first visible line index."""
         oled.fill(0)
-        for i, ln in enumerate(lines):
-            oled.text(ln, 0, i * 8)
+        # -- Fixed header --
+        oled.text("TRANSCRIPT", 0, 1)
+        # Separator line
+        for x in range(128):
+            oled.pixel(x, HEADER_H - 1, 1)
+
+        # -- Scrollable content --
+        vis_start = int(scroll_line_offset)
+        vis_end = min(vis_start + VISIBLE_LINES + 1, total_lines)
+        pixel_shift = int((scroll_line_offset - vis_start) * 8)
+
+        y = HEADER_H
+        for i in range(vis_start, vis_end):
+            draw_y = y + (i - vis_start) * 8 - pixel_shift
+            if HEADER_H <= draw_y < 64:
+                oled.text(lines[i], 0, draw_y)
+
+        # -- Scroll indicators --
+        if scroll_line_offset > 0:
+            # Up arrow at top-right
+            oled.text("^", 120, HEADER_H)
+        if vis_start + VISIBLE_LINES < total_lines:
+            # Down arrow at bottom-right
+            oled.text("v", 120, 56)
+
         oled.show()
-    else:
-        # Animation: Show first page, then scroll down line by line
-        oled.fill(0)
-        for i, ln in enumerate(lines[:8]):
-            oled.text(ln, 0, i * 8)
-        oled.show()
-        time.sleep(3) # Pause so you can read the start
-        
-        for start_idx in range(1, len(lines) - 7):
-            oled.fill(0)
-            visible = lines[start_idx : start_idx + 8]
-            for i, ln in enumerate(visible):
-                oled.text(ln, 0, i * 8)
-            oled.show()
-            time.sleep(1.2) # Delays for comfortable reading of the new line
+
+    # If all lines fit without scrolling
+    if total_lines <= VISIBLE_LINES:
+        _draw_frame(0)
+        return
+
+    # -- Animated scroll: loop twice so user can re-read --
+    max_offset = total_lines - VISIBLE_LINES
+
+    for loop in range(2):
+        # Show top, pause to read
+        _draw_frame(0)
+        time.sleep(3)
+
+        # Scroll down line by line (smooth)
+        for line_idx in range(max_offset):
+            # Sub-pixel smooth scroll: 4 steps per line (2px each)
+            for step in range(4):
+                offset = line_idx + (step / 4.0)
+                _draw_frame(offset)
+                time.sleep_ms(80)
+            # Small pause after each full line scrolls in
+            time.sleep_ms(150)
+
+        # Show bottom, pause to read
+        _draw_frame(max_offset)
+        time.sleep(4)
+
+        # Scroll back up quickly for next loop
+        if loop < 1:
+            for line_idx in range(max_offset, -1, -1):
+                _draw_frame(line_idx)
+                time.sleep_ms(40)
+            time.sleep(1)
 
 
 # ---------------------------------------------------------------
