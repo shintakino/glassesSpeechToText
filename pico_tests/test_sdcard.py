@@ -88,6 +88,8 @@ def run_test():
     # 3. Mount the SD Card
     print("\nMounting SD Card...")
     try:
+        print(f"DEBUG sdcard type: {type(sdcard)}")
+        print(f"DEBUG sdcard dir: {dir(sdcard)}")
         sd = sdcard.SDCard(spi, cs)
         vfs = os.VfsFat(sd)
         os.mount(vfs, "/sd")
